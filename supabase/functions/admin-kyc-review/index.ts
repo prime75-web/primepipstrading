@@ -53,13 +53,6 @@ Deno.serve(async (req) => {
       application.address_document_path,
       ...(archivedDocuments ?? []).map((document) => document.storage_path),
     ].filter((path): path is string => Boolean(path)))];
-    if (paths.length) {
-      const { error: removalError } = await admin.storage.from("kyc-documents").remove(paths);
-      if (removalError) {
-        console.error("Could not remove KYC documents:", removalError.message);
-        return json({ error: "Could not remove KYC documents; review was not completed" }, 500);
-      }
-    }
 
     const { data, error } = await anon.rpc("review_kyc", {
       p_kyc_id: body.kycId,
@@ -68,7 +61,14 @@ Deno.serve(async (req) => {
     });
     if (error) {
       console.error("Could not record KYC review:", error.message);
-      return json({ error: "Documents were removed, but the review could not be recorded" }, 409);
+      return json({ error: "The KYC review could not be recorded" }, 409);
+    }
+
+    if (paths.length) {
+      const { error: removalError } = await admin.storage.from("kyc-documents").remove(paths);
+      if (removalError) {
+        console.error("Could not remove KYC documents after review:", removalError.message);
+      }
     }
 
     return json(data);

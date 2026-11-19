@@ -976,8 +976,19 @@ export default function Admin({ section }: { section?: AdminSection }) {
         rejectionReason: reason || null,
       },
     });
-    if (reviewError) setError(reviewError.message);
-    else
+    if (reviewError) {
+      let message = reviewError.message;
+      if (reviewError instanceof FunctionsHttpError) {
+        const responseText = await reviewError.context.text();
+        try {
+          const responseBody = JSON.parse(responseText) as { error?: string };
+          if (responseBody.error) message = responseBody.error;
+        } catch {
+          // Keep the generic invocation error when the response is not JSON.
+        }
+      }
+      setError(message);
+    } else
       setSnapshot((current) =>
         current
           ? {
