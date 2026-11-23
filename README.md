@@ -7,6 +7,8 @@ Deploy the function and migration from a machine authenticated with Supabase CLI
 ```bash
 npx supabase login
 npx supabase functions deploy admin-snapshot --project-ref wnbynyymqhkestmkcenj
+npx supabase functions deploy admin-kyc-review --project-ref wnbynyymqhkestmkcenj
+npx supabase functions deploy admin-kyc-document --project-ref wnbynyymqhkestmkcenj
 npx supabase db push --project-ref wnbynyymqhkestmkcenj
 ```
 # PrimePips Platform
