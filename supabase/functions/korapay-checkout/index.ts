@@ -1,5 +1,6 @@
 import { createClient } from "npm:@supabase/supabase-js@2";
 import { corsHeaders } from "npm:@supabase/supabase-js@2/cors";
+import { calculateCouponPrice } from "../_shared/coupon-pricing.js";
 
 const PAYSTACK_SECRET_KEY = Deno.env.get("PAYSTACK_SECRET_KEY");
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
@@ -65,7 +66,9 @@ Deno.serve(async (req) => {
     const body = await req.json().catch(() => null);
     const challengeType = body?.challengeType;
     const accountSize = Number(body?.accountSize);
-    const paymentMethod = body?.paymentMethod === "other" ? "other" : "bank_transfer";
+    const paymentMethod = ["bank_transfer", "card", "other"].includes(body?.paymentMethod)
+      ? body.paymentMethod
+      : "bank_transfer";
     const couponCode = typeof body?.couponCode === "string"
       ? body.couponCode.trim().toUpperCase().slice(0, 32)
       : null;
@@ -89,14 +92,15 @@ Deno.serve(async (req) => {
 
     // Validate the coupon server-side; never trust a client-supplied discount.
     let discountPercent = 0;
+    let priceUsd = basePriceUsd;
     let appliedCoupon: string | null = null;
-    let couponId: string | null = null;
-    let couponUses = 0;
+    let bogoBonusChallengeType: ChallengeType | null = null;
+    let bogoBonusAccountSize: number | null = null;
 
     if (couponCode) {
       const couponQuery = await admin
         .from("coupons")
-        .select("id, code, discount_percent, challenge_types, expires_at, max_uses, times_used")
+        .select("id, code, discount_percent, challenge_types, coupon_type, pay_percent, bonus_challenge_type, bonus_size_mode, bonus_account_size, expires_at, max_uses, times_used")
         .eq("code", couponCode)
         .eq("is_active", true)
         .maybeSingle();
@@ -110,7 +114,18 @@ Deno.serve(async (req) => {
           .eq("is_active", true)
           .maybeSingle();
         if (affiliateQuery.data) {
-          row = { ...affiliateQuery.data, challenge_types: null, expires_at: null, max_uses: null, times_used: 0 };
+          row = {
+            ...affiliateQuery.data,
+            coupon_type: "discount",
+            pay_percent: null,
+            bonus_challenge_type: null,
+            bonus_size_mode: null,
+            bonus_account_size: null,
+            challenge_types: null,
+            expires_at: null,
+            max_uses: null,
+            times_used: 0,
+          };
         }
       }
       const invalidCoupon = json(
@@ -129,13 +144,41 @@ Deno.serve(async (req) => {
         return invalidCoupon;
       }
 
-      discountPercent = Number(row.discount_percent);
+      if (row.coupon_type === "bogo") {
+        const validSizes = [5000, 10000, 25000, 50000, 100000, 200000];
+        if (
+          !Array.isArray(types) ||
+          types.length !== 1 ||
+          types[0] !== challengeType ||
+          !CHALLENGE_TYPES.includes(row.bonus_challenge_type) ||
+          !["same_as_primary", "fixed"].includes(row.bonus_size_mode)
+        ) {
+          return invalidCoupon;
+        }
+
+        bogoBonusChallengeType = row.bonus_challenge_type as ChallengeType;
+        bogoBonusAccountSize = row.bonus_size_mode === "same_as_primary"
+          ? accountSize
+          : Number(row.bonus_account_size);
+        if (
+          !validSizes.includes(bogoBonusAccountSize) ||
+          (row.bonus_size_mode === "fixed" && !row.bonus_account_size)
+        ) {
+          return invalidCoupon;
+        }
+      }
+
+      const couponPricing = calculateCouponPrice(basePriceUsd, {
+        couponType: row.coupon_type ?? "discount",
+        payPercent: row.pay_percent,
+        discountPercent: Number(row.discount_percent),
+      });
+      if (!couponPricing) return invalidCoupon;
+      discountPercent = couponPricing.discountPercent;
+      priceUsd = couponPricing.priceUsd;
       appliedCoupon = row.code;
-      couponId = row.id;
-      couponUses = uses;
     }
 
-    const priceUsd = Math.round(basePriceUsd * (100 - discountPercent)) / 100;
     const rate = await getNairaRate();
     const localAmount = Math.ceil(priceUsd * rate);
 
@@ -156,6 +199,8 @@ Deno.serve(async (req) => {
         payment_amount_local: localAmount,
         coupon_code: appliedCoupon,
         discount_percent: discountPercent,
+        bogo_bonus_challenge_type: bogoBonusChallengeType,
+        bogo_bonus_account_size: bogoBonusAccountSize,
       })
       .select("id")
       .single();
@@ -194,7 +239,9 @@ Deno.serve(async (req) => {
         callback_url: redirectUrl,
         channels: paymentMethod === "bank_transfer"
           ? ["bank_transfer"]
-          : ["card", "ussd", "mobile_money", "bank_transfer", "bank"],
+          : paymentMethod === "card"
+            ? ["card"]
+            : ["card", "ussd", "mobile_money", "bank_transfer", "bank"],
         email,
         metadata: {
           account_id: account.id,
@@ -209,7 +256,7 @@ Deno.serve(async (req) => {
     if (!paystackRes.ok) {
       console.error(`Paystack initialize failed [${paystackRes.status}]: ${paystackBody}`);
       await admin.from("payment_orders").update({ status: "failed", failure_reason: "Paystack initialization failed" }).eq("provider_reference", reference);
-      await admin.from("accounts").update({ status: "failed" }).eq("id", account.id).eq("status", "pending_payment");
+      await admin.from("accounts").delete().eq("id", account.id).eq("status", "pending_payment");
       return json(
         { error: "Payment provider request failed", status: paystackRes.status, details: paystackBody },
         paystackRes.status,
@@ -220,12 +267,8 @@ Deno.serve(async (req) => {
     if (parsed?.status !== true || !parsed?.data?.authorization_url) {
       console.error("Paystack returned an unsuccessful payload:", paystackBody);
       await admin.from("payment_orders").update({ status: "failed", failure_reason: "Paystack returned an invalid initialization response" }).eq("provider_reference", reference);
-      await admin.from("accounts").update({ status: "failed" }).eq("id", account.id).eq("status", "pending_payment");
+      await admin.from("accounts").delete().eq("id", account.id).eq("status", "pending_payment");
       return json({ error: parsed?.message || "Payment provider error", details: paystackBody }, 502);
-    }
-
-    if (couponId) {
-      await admin.from("coupons").update({ times_used: couponUses + 1 }).eq("id", couponId);
     }
 
     return json({

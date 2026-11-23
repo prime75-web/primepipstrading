@@ -1,8 +1,9 @@
+import { useEffect } from "react";
 import { Toaster } from "@/components/ui/toaster";
 import { Toaster as Sonner } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, Routes, Route } from "react-router-dom";
+import { BrowserRouter, Routes, Route, useLocation } from "react-router-dom";
 import Index from "./pages/Index";
 import Login from "./pages/Login";
 import Register from "./pages/Register";
@@ -17,7 +18,6 @@ import KYC from "./pages/KYC";
 import Pricing from "./pages/Pricing";
 import HowItWorks from "./pages/HowItWorks";
 import FAQ from "./pages/FAQ";
-import PurchaseAccount from "./pages/PurchaseAccount";
 import TradingPlatform from "./pages/TradingPlatform";
 import Terms from "./pages/Terms";
 import Privacy from "./pages/Privacy";
@@ -32,14 +32,27 @@ import {
 } from "./pages/FooterPages";
 import NotFound from "./pages/NotFound";
 import Admin from "./pages/Admin";
+import TraderDetails from "./pages/TraderDetails";
+import AffiliateDetails from "./pages/AffiliateDetails";
 import AuthCallback from "./pages/AuthCallback";
 import ForgotPassword from "./pages/ForgotPassword";
 import ResetPassword from "./pages/ResetPassword";
 import VerifyEmail from "./pages/VerifyEmail";
+import PurchaseAccount from "./pages/PurchaseAccount";
 import { Navigate } from "react-router-dom";
 import { FaqSupportBot } from "./components/support/FaqSupportBot";
 
 const queryClient = new QueryClient();
+
+function ScrollToTop() {
+  const { pathname } = useLocation();
+
+  useEffect(() => {
+    window.scrollTo(0, 0);
+  }, [pathname]);
+
+  return null;
+}
 
 const App = () => (
   <div className="w-full min-h-screen overflow-x-hidden">
@@ -48,6 +61,7 @@ const App = () => (
         <Toaster />
         <Sonner />
         <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+          <ScrollToTop />
           <Routes>
             <Route path="/" element={<Index />} />
             <Route path="/login" element={<Login />} />
@@ -68,10 +82,13 @@ const App = () => (
             <Route path="/admin" element={<Admin />} />
             <Route path="/admin/kyc" element={<Admin section="kyc" />} />
             <Route path="/admin/traders" element={<Admin section="traders" />} />
+            <Route path="/admin/traders/:userId" element={<TraderDetails />} />
+            <Route path="/admin/affiliates/:userId" element={<AffiliateDetails />} />
             <Route path="/admin/exposure" element={<Admin section="exposure" />} />
             <Route path="/admin/referrals" element={<Admin section="referrals" />} />
             <Route path="/admin/affiliates" element={<Admin section="affiliates" />} />
             <Route path="/admin/activity" element={<Admin section="activity" />} />
+            <Route path="/admin/purchased-accounts" element={<Admin section="purchases" />} />
             <Route path="/admin/payouts" element={<Admin section="payouts" />} />
             <Route path="/admin/payments" element={<Admin section="payments" />} />
             <Route path="/admin/coupons" element={<Admin section="coupons" />} />

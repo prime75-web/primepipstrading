@@ -32,34 +32,67 @@ Deno.serve(async (req) => {
     }
 
     const admin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-    const [{ data: usersData, error: usersError }, accounts, positions, referrals, applications, affiliateCodes, history, kyc, kycDocuments, payments, payouts, coupons] = await Promise.all([
+    const [{ data: usersData, error: usersError }, accounts, positions, referrals, applications, affiliateCodes, affiliateBalances, history, kyc, kycDocuments, payments, payouts, coupons] = await Promise.all([
       admin.auth.admin.listUsers({ page: 1, perPage: 1000 }),
-      admin.from("accounts").select("id, user_id, account_size, challenge_type, status, current_balance, profit_loss, current_phase, updated_at, created_at"),
-      admin.from("positions").select("id, account_id, asset_id, position_type, lot_size, profit_loss, status, opened_at, entry_price, stop_loss, take_profit, assets(symbol, pip_value, asset_type, quote_currency, lot_size)"),
+      admin.from("accounts").select("id, user_id, account_size, challenge_type, status, current_balance, profit_loss, current_phase, high_water_mark, daily_start_balance, daily_start_date, max_drawdown_percent, daily_drawdown_percent, consistency_score, best_trading_day_profit, closed_profit_total, drawdown_violated, risk_monitoring_degraded, violation_type, phase_passed, archived_at, archive_expires_at, updated_at, created_at, coupon_code, price, payment_currency, payment_amount_local, payment_provider, payment_reference, bogo_bonus_challenge_type, bogo_bonus_account_size, bonus_of_account_id"),
+      admin.from("positions").select("id, account_id, asset_id, position_type, lot_size, profit_loss, status, opened_at, closed_at, entry_price, exit_price, stop_loss, take_profit, assets(symbol, pip_value, asset_type, quote_currency, lot_size)"),
       admin.from("referrals").select("referrer_id, referred_user_id, status, commission_earned, referred_at, account_purchased"),
       admin.from("affiliate_applications").select("id, user_id, desired_code, phone, country, website, instagram, tiktok, youtube, x_handle, audience_size, promotion_channels, affiliate_experience, promotion_plan, status, rejection_reason, created_at, updated_at").order("created_at", { ascending: false }),
       admin.from("affiliate_codes").select("id, user_id, code, discount_percent, is_active, created_at").order("created_at", { ascending: false }),
-      admin.from("trade_history").select("id, account_id, symbol, action, lot_size, profit_loss, created_at, price").order("created_at", { ascending: false }).limit(200),
+      admin.from("affiliate_balances").select("user_id, available, reserved, paid"),
+      admin.from("trade_history").select("id, account_id, symbol, action, lot_size, profit_loss, created_at, price, notes").order("created_at", { ascending: false }),
       admin.from("kyc_verifications").select("id, user_id, identity_document_type, identity_document_path, identity_submitted_at, address_document_type, address_document_path, address_submitted_at, status, rejection_reason, reviewed_at, reviewed_by, created_at, updated_at").order("created_at", { ascending: false }),
       admin.from("kyc_documents").select("id, kyc_id, document_kind, document_type, storage_path, submitted_at").order("submitted_at", { ascending: false }),
       admin.from("payment_orders").select("id, user_id, account_id, provider, provider_reference, amount, currency, status, checkout_at, verified_at, webhook_at, failure_reason, refund_amount, refunded_at").order("checkout_at", { ascending: false }).limit(200),
-      admin.from("payout_requests").select("id, user_id, account_id, amount, method, destination, source, status, created_at, updated_at, reviewed_by, reviewed_at").order("created_at", { ascending: false }).limit(200),
-      admin.from("coupons").select("id, code, discount_percent, challenge_types, is_active, expires_at, max_uses, times_used, created_at, updated_at").order("created_at", { ascending: false }),
+      admin.from("payout_requests").select("id, user_id, account_id, amount, method, destination, source, status, rejection_reason, created_at, updated_at, reviewed_by, reviewed_at").order("created_at", { ascending: false }).limit(200),
+      admin.from("coupons").select("id, code, discount_percent, challenge_types, coupon_type, pay_percent, bonus_challenge_type, bonus_size_mode, bonus_account_size, is_active, expires_at, max_uses, times_used, created_at, updated_at").order("created_at", { ascending: false }),
     ]);
 
     if (usersError) {
       console.error("Could not load users:", usersError.message);
       return json({ error: "Could not load users" }, 500);
     }
-    const failed = [accounts, positions, referrals, applications, affiliateCodes, history, kyc, kycDocuments, payments, payouts, coupons].find((result) => result.error);
-    if (failed?.error) {
-      console.error("Could not load platform data:", failed.error.message);
-      return json({ error: "Could not load platform data" }, 500);
-    }
+    const readData = <T,>(result: { data: T[] | null; error: { message: string } | null }, source: string) => {
+      if (result.error) {
+        console.error(`Could not load ${source}:`, result.error.message);
+        return [] as T[];
+      }
+      return result.data ?? [];
+    };
+    const accountsData = readData(accounts, "accounts");
+    const positionsData = readData(positions, "positions");
+    const referralsData = readData(referrals, "referrals");
+    const applicationsData = readData(applications, "affiliate applications");
+    const affiliateCodesData = readData(affiliateCodes, "affiliate codes");
+    const affiliateBalancesData = readData(affiliateBalances, "affiliate balances");
+    const historyData = readData(history, "trade history");
+    const kycData = readData(kyc, "kyc");
+    const kycDocumentsData = readData(kycDocuments, "kyc documents");
+    const paymentsData = readData(payments, "payments");
+    const payoutsData = readData(payouts, "payouts");
+    const couponsData = readData(coupons, "coupons");
 
     const users = usersData?.users ?? [];
     const adminUserIds = new Set(users.filter((user) => user.app_metadata?.role === "admin").map((user) => user.id));
-    const visibleAccounts = (accounts.data ?? []).filter((account) => !adminUserIds.has(account.user_id));
+    const visibleAccounts = accountsData.filter((account) => !adminUserIds.has(account.user_id));
+    const accountById = new Map(visibleAccounts.map((account) => [account.id, account]));
+    const fundedStartByAccount = new Map<string, string>();
+    for (const trade of historyData) {
+      if (trade.action !== "phase_advance" || !trade.notes?.toLowerCase().includes("funded")) continue;
+      const current = fundedStartByAccount.get(trade.account_id);
+      if (!current || new Date(trade.created_at) > new Date(current)) fundedStartByAccount.set(trade.account_id, trade.created_at);
+    }
+    const auditedPayouts = payoutsData.map((payout) => {
+      if (payout.source !== "trading_profit") return { ...payout, auditFlag: null };
+      const account = payout.account_id ? accountById.get(payout.account_id) : null;
+      const fundedStart = account && (fundedStartByAccount.get(account.id) ?? account.funded_started_at);
+      const submittedBeforeFunded = !fundedStart || new Date(payout.created_at) < new Date(fundedStart);
+      const accountNotFunded = account?.status !== "funded";
+      return {
+        ...payout,
+        auditFlag: submittedBeforeFunded || accountNotFunded ? "legacy_or_pre_funded" : null,
+      };
+    });
 
     return json({
       users: (users ?? []).filter((user) => user.app_metadata?.role !== "admin").map((user) => ({
@@ -72,16 +105,17 @@ Deno.serve(async (req) => {
         isAdmin: user.app_metadata?.role === "admin",
       })),
       accounts: visibleAccounts,
-      positions: positions.data ?? [],
-      referrals: referrals.data ?? [],
-      affiliateApplications: applications.data ?? [],
-      affiliateCodes: affiliateCodes.data ?? [],
-      history: history.data ?? [],
-      kyc: kyc.data ?? [],
-      kycDocuments: kycDocuments.data ?? [],
-      payments: payments.data ?? [],
-      payouts: payouts.data ?? [],
-      coupons: coupons.data ?? [],
+      positions: positionsData,
+      referrals: referralsData,
+      affiliateApplications: applicationsData,
+      affiliateCodes: affiliateCodesData,
+      affiliateBalances: affiliateBalancesData,
+      history: historyData,
+      kyc: kycData,
+      kycDocuments: kycDocumentsData,
+      payments: paymentsData,
+      payouts: auditedPayouts,
+      coupons: couponsData,
       generatedAt: new Date().toISOString(),
     });
   } catch (error) {

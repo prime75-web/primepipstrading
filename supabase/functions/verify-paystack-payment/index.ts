@@ -46,7 +46,7 @@ Deno.serve(async (req) => {
     const admin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
     const { data: payment, error: accountError } = await admin
       .from("payment_orders")
-      .select("id, user_id, account_id, provider_reference, amount, currency")
+      .select("id, user_id, account_id, provider_reference, amount, currency, status, pixel_fired")
       .eq("provider", "paystack")
       .eq("provider_reference", reference)
       .maybeSingle();
@@ -65,16 +65,30 @@ Deno.serve(async (req) => {
     );
     const paystackBody = await paystackResponse.json().catch(() => null);
     const transaction = paystackBody?.data;
-    if (!paystackResponse.ok || !transaction) {
+    if (
+      !paystackResponse.ok ||
+      paystackBody?.status !== true ||
+      !transaction ||
+      transaction.reference !== reference ||
+      typeof transaction.status !== "string" ||
+      !Number.isFinite(Number(transaction.amount)) ||
+      Number(transaction.amount) < 0 ||
+      typeof transaction.currency !== "string"
+    ) {
       console.error("Paystack verification failed:", paystackBody);
       return json({ error: "Payment verification is temporarily unavailable" }, 502);
     }
 
-    const paidAmount = Number(transaction?.amount ?? 0) / 100;
+    const paidAmount = Number(transaction.amount) / 100;
     const providerUserId = typeof transaction?.metadata?.user_id === "string" && /^[0-9a-f-]{36}$/i.test(transaction.metadata.user_id) ? transaction.metadata.user_id : null;
+
     const { data: result, error: reconcileError } = await admin.rpc("reconcile_paystack_payment", {
       p_reference: reference,
-      p_status: transaction.status === "success" ? "success" : transaction.status === "failed" ? "failed" : "pending",
+      p_status: transaction.status === "success"
+        ? "success"
+        : ["failed", "abandoned", "cancelled"].includes(transaction.status)
+          ? "failed"
+          : "pending",
       p_amount: paidAmount,
       p_currency: transaction.currency || null,
       p_provider_user_id: providerUserId,
@@ -82,7 +96,38 @@ Deno.serve(async (req) => {
       p_source: "verification",
     });
     if (reconcileError) throw reconcileError;
-    return json({ verified: result?.status === "success", ...result });
+    if (result?.status === "success") {
+      const { data: claimedPayment, error: claimError } = await admin
+        .from("payment_orders")
+        .update({ pixel_fired: true })
+        .eq("id", payment.id)
+        .eq("pixel_fired", false)
+        .select("id, amount, currency")
+        .maybeSingle();
+
+      if (claimError) {
+        console.error("Failed to claim Meta Purchase event:", claimError.message);
+        throw claimError;
+      }
+
+      if (claimedPayment) {
+        const purchaseValue = Number(claimedPayment.amount);
+        if (Number.isFinite(purchaseValue) && purchaseValue >= 0) {
+          return json({
+            verified: true,
+            provider_status: transaction.status,
+            ...result,
+            purchase: {
+              value: purchaseValue,
+              currency: "NGN",
+              orderId: claimedPayment.id,
+            },
+          });
+        }
+      }
+    }
+
+    return json({ verified: result?.status === "success", provider_status: transaction.status, ...result });
   } catch (error) {
     console.error("verify-paystack-payment error:", error);
     return json({ error: error instanceof Error ? error.message : "Unexpected error" }, 500);

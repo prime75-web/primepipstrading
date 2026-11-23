@@ -1,11 +1,11 @@
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Check, Star, HelpCircle, Target, Clock, Zap, Rocket } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { supabase } from "@/integrations/supabase/client";
+import { getChallengeDisplayRules } from "@/lib/challengeRules";
 import {
   Popover,
   PopoverContent,
@@ -13,17 +13,6 @@ import {
 } from "@/components/ui/popover";
 
 type ChallengeType = "three_step" | "two_step" | "one_step" | "instant";
-
-interface ChallengeRules {
-  dailyDrawdown: string;
-  maxDrawdown: string;
-  profitTarget: string;
-  consistencyRule: string;
-  minTradingDays: string;
-  weekendTrading: string;
-  maxTradingDays: string;
-  payouts?: string;
-}
 
 const ruleExplanations: Record<string, string> = {
   dailyDrawdown: "Maximum loss allowed in a single trading day.",
@@ -37,46 +26,6 @@ const ruleExplanations: Record<string, string> = {
 };
 
 const noConsistencyRuleExplanation = "No consistency rule means you can trade freely.";
-
-const challengeRules: Record<ChallengeType, ChallengeRules> = {
-  three_step: {
-    dailyDrawdown: "4%",
-    maxDrawdown: "6% (trailing)",
-    profitTarget: "10%",
-    consistencyRule: "None",
-    minTradingDays: "4 days",
-    weekendTrading: "Allowed",
-    maxTradingDays: "Unlimited",
-  },
-  two_step: {
-    dailyDrawdown: "4%",
-    maxDrawdown: "8% (trailing)",
-    profitTarget: "10%",
-    consistencyRule: "None",
-    minTradingDays: "4 days",
-    weekendTrading: "Allowed",
-    maxTradingDays: "Unlimited",
-  },
-  one_step: {
-    dailyDrawdown: "6%",
-    maxDrawdown: "8% (trailing)",
-    profitTarget: "10%",
-    consistencyRule: "None",
-    minTradingDays: "4 days",
-    weekendTrading: "Allowed",
-    maxTradingDays: "Unlimited",
-  },
-  instant: {
-    dailyDrawdown: "6%",
-    maxDrawdown: "10%",
-    profitTarget: "N/A",
-    consistencyRule: "30%",
-    minTradingDays: "None",
-    weekendTrading: "Allowed",
-    maxTradingDays: "Unlimited",
-    payouts: "Biweekly",
-  },
-};
 
 const challengeTypes: { id: ChallengeType; label: string; icon: React.ElementType; description: string; badge?: string }[] = [
   { id: "three_step", label: "3-Step", icon: Target, description: "3 phases to prove your skills" },
@@ -123,37 +72,12 @@ function RuleItem({ label, value, ruleKey }: { label: string; value: string; rul
 export function PricingSection() {
   const navigate = useNavigate();
   const [selectedChallenge, setSelectedChallenge] = useState<ChallengeType>("one_step");
-  const [isLoggedIn, setIsLoggedIn] = useState<boolean | null>(null);
 
-  useEffect(() => {
-    const checkAuth = async () => {
-      const { data: { session } } = await supabase.auth.getSession();
-      setIsLoggedIn(!!session);
-    };
-    checkAuth();
-
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_, session) => {
-      setIsLoggedIn(!!session);
-    });
-
-    return () => subscription.unsubscribe();
-  }, []);
-
-  const handlePurchase = (size: number) => {
-    // Store selection in sessionStorage for after login/signup
-    sessionStorage.setItem("pendingPurchase", JSON.stringify({
-      challengeType: selectedChallenge,
-      accountSize: size,
-    }));
-
-    if (isLoggedIn) {
-      navigate(`/purchase?challenge=${selectedChallenge}&size=${size}`);
-    } else {
-      navigate(`/register?redirect=purchase&challenge=${selectedChallenge}&size=${size}`);
-    }
+  const handlePurchase = () => {
+    navigate("/purchase");
   };
 
-  const rules = challengeRules[selectedChallenge];
+  const rules = getChallengeDisplayRules(selectedChallenge);
 
   return (
     <section className="py-16 sm:py-24 relative" id="pricing">
@@ -264,17 +188,13 @@ export function PricingSection() {
                     <Check className="w-3 sm:w-4 h-3 sm:h-4 text-primary shrink-0 mt-0.5" />
                     <span className="text-muted-foreground">Weekend Trading</span>
                   </li>
-                  <li className="flex items-start gap-2">
-                    <Check className="w-3 sm:w-4 h-3 sm:h-4 text-primary shrink-0 mt-0.5" />
-                    <span className="text-muted-foreground">Crypto Payments</span>
-                  </li>
                 </ul>
                 <Button
                   variant={account.popular ? "gold" : "outline"}
                   className="w-full text-sm sm:text-base py-2 sm:py-2.5"
-                  onClick={() => handlePurchase(account.size)}
+                  onClick={handlePurchase}
                 >
-                  {isLoggedIn ? "Purchase Now" : "Get Started"}
+                  Purchases Paused
                 </Button>
               </CardContent>
             </Card>

@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   Activity,
+  BarChart3,
   ArrowDownRight,
   ArrowUpRight,
   ChevronDown,
@@ -17,18 +18,25 @@ import {
   FileCheck2,
   ExternalLink,
   Gift,
+  Award,
   Plus,
   Pencil,
   Trash2,
   XCircle,
+  Archive,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import DashboardLayout from "@/components/layout/DashboardLayout";
 import { supabase } from "@/integrations/supabase/client";
+import { FunctionsHttpError } from "@supabase/supabase-js";
 import { useTradingViewPrices } from "@/hooks/useTradingViewPrices";
 import { calculatePositionPL } from "@/lib/tradingCalculations";
+import { countAffiliateCodeUses } from "@/lib/affiliateCodeUsage";
+import { formatCouponUsage } from "@/lib/purchasedAccountDisplay.js";
+import { getAccountVisitChanges } from "@/lib/accountVisitChanges.js";
+import { getPhaseRules } from "@/lib/challengeRules";
 import { cn } from "@/lib/utils";
 import {
   Collapsible,
@@ -65,6 +73,29 @@ type Account = {
   current_balance: number | null;
   profit_loss: number | null;
   current_phase: number | null;
+  consistency_score: number | null;
+  best_trading_day_profit: number | null;
+  closed_profit_total: number | null;
+  high_water_mark: number | null;
+  daily_start_balance: number | null;
+  daily_start_date: string | null;
+  max_drawdown_percent: number | null;
+  daily_drawdown_percent: number | null;
+  drawdown_violated: boolean | null;
+  risk_monitoring_degraded: boolean;
+  violation_type: string | null;
+  phase_passed: boolean | null;
+  archived_at: string | null;
+  archive_expires_at: string | null;
+  coupon_code: string | null;
+  bogo_bonus_account_size: number | null;
+  bogo_bonus_challenge_type: GrantChallenge | null;
+  bonus_of_account_id: string | null;
+  price: number | null;
+  payment_currency: string | null;
+  payment_amount_local: number | null;
+  payment_provider: string | null;
+  payment_reference: string | null;
   updated_at: string;
   created_at: string;
 };
@@ -84,7 +115,9 @@ type Position = {
   profit_loss: number | null;
   status: string;
   opened_at: string;
+  closed_at: string | null;
   entry_price: number;
+  exit_price: number | null;
   stop_loss: number | null;
   take_profit: number | null;
   assets?: Asset;
@@ -125,6 +158,12 @@ type AffiliateCode = {
   is_active: boolean;
   created_at: string;
 };
+type AffiliateBalance = {
+  user_id: string;
+  available: number;
+  reserved: number;
+  paid: number;
+};
 type History = {
   id: string;
   account_id: string;
@@ -134,6 +173,7 @@ type History = {
   profit_loss: number | null;
   created_at: string;
   price: number;
+  notes: string | null;
 };
 type Payment = {
   id: string;
@@ -158,12 +198,14 @@ type Payout = {
   amount: number;
   method: string;
   destination: string;
-  source: "trading_profit" | "referral_commission";
+  source: "trading_profit" | "referral_commission" | "manual_award";
   status: string;
   created_at: string;
   updated_at: string;
   reviewed_by: string | null;
   reviewed_at: string | null;
+  rejection_reason: string | null;
+  auditFlag?: "legacy_or_pre_funded" | null;
 };
 type AdminSection =
   | "traders"
@@ -174,6 +216,7 @@ type AdminSection =
   | "kyc"
   | "payments"
   | "payouts"
+  | "purchases"
   | "coupons";
 type Kyc = {
   id: string;
@@ -206,6 +249,7 @@ type Snapshot = {
   referrals: Referral[];
   affiliateApplications: AffiliateApplication[];
   affiliateCodes: AffiliateCode[];
+  affiliateBalances: AffiliateBalance[];
   history: History[];
   kyc: Kyc[];
   kycDocuments: KycDocument[];
@@ -220,6 +264,11 @@ type Coupon = {
   code: string;
   discount_percent: number;
   challenge_types: GrantChallenge[] | null;
+  coupon_type: "discount" | "bogo";
+  pay_percent: number | null;
+  bonus_challenge_type: GrantChallenge | null;
+  bonus_size_mode: "same_as_primary" | "fixed" | null;
+  bonus_account_size: number | null;
   is_active: boolean;
   expires_at: string | null;
   max_uses: number | null;
@@ -235,6 +284,7 @@ const normalizeSnapshot = (data: Partial<Snapshot>): Snapshot => ({
   referrals: data.referrals ?? [],
   affiliateApplications: data.affiliateApplications ?? [],
   affiliateCodes: data.affiliateCodes ?? [],
+  affiliateBalances: data.affiliateBalances ?? [],
   history: data.history ?? [],
   kyc: data.kyc ?? [],
   kycDocuments: data.kycDocuments ?? [],
@@ -270,8 +320,15 @@ const isPurchasedAccount = (account: Account) =>
 export default function Admin({ section }: { section?: AdminSection }) {
   const navigate = useNavigate();
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
+  const [accountVisitChanges, setAccountVisitChanges] = useState<{
+    added: number;
+    removed: number;
+  } | null>(null);
+  const [accountVisitTrackingError, setAccountVisitTrackingError] = useState("");
+  const accountVisitInitialized = useRef(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [showAllPayments, setShowAllPayments] = useState(false);
   const [updatingAffiliate, setUpdatingAffiliate] = useState<string | null>(
     null,
   );
@@ -287,6 +344,7 @@ export default function Admin({ section }: { section?: AdminSection }) {
   const [editingAccount, setEditingAccount] = useState<Account | null>(null);
   const [savingAccount, setSavingAccount] = useState(false);
   const [deletingAccount, setDeletingAccount] = useState<string | null>(null);
+  const [deletingAllArchived, setDeletingAllArchived] = useState(false);
   const [resettingAccount, setResettingAccount] = useState<string | null>(null);
   const [deletingUser, setDeletingUser] = useState(false);
   const [deleteUserId, setDeleteUserId] = useState("");
@@ -304,8 +362,13 @@ export default function Admin({ section }: { section?: AdminSection }) {
   const [bulkClosing, setBulkClosing] = useState(false);
   const [editingCoupon, setEditingCoupon] = useState<Coupon | null>(null);
   const [couponCode, setCouponCode] = useState("");
+  const [couponType, setCouponType] = useState<"discount" | "bogo">("discount");
   const [couponDiscount, setCouponDiscount] = useState("10");
   const [couponTypes, setCouponTypes] = useState<GrantChallenge[]>([]);
+  const [couponPayPercent, setCouponPayPercent] = useState("75");
+  const [couponBonusChallenge, setCouponBonusChallenge] = useState<GrantChallenge>("instant");
+  const [couponBonusSizeMode, setCouponBonusSizeMode] = useState<"same_as_primary" | "fixed">("same_as_primary");
+  const [couponBonusSize, setCouponBonusSize] = useState("5000");
   const [couponExpires, setCouponExpires] = useState("");
   const [couponMaxUses, setCouponMaxUses] = useState("");
   const [couponActive, setCouponActive] = useState(true);
@@ -314,11 +377,28 @@ export default function Admin({ section }: { section?: AdminSection }) {
   const [selectedAffiliateApplication, setSelectedAffiliateApplication] = useState<AffiliateApplication | null>(null);
   const [savingAffiliateCode, setSavingAffiliateCode] = useState<string | null>(null);
   const [affiliateCodeDrafts, setAffiliateCodeDrafts] = useState<Record<string, { discount: string; isActive: boolean }>>({});
+  const [affiliateAssignDrafts, setAffiliateAssignDrafts] = useState<Record<string, string>>({});
   const [reviewingPayout, setReviewingPayout] = useState<string | null>(null);
   const [selectedPayout, setSelectedPayout] = useState<Payout | null>(null);
+  const [payoutRejectionReason, setPayoutRejectionReason] = useState("");
+  const [manualAwardOpen, setManualAwardOpen] = useState(false);
+  const [manualAwardUserId, setManualAwardUserId] = useState("");
+  const [manualAwardChallenge, setManualAwardChallenge] = useState<GrantChallenge>("instant");
+  const [manualAwardSize, setManualAwardSize] = useState("10000");
+  const [manualAwardAmount, setManualAwardAmount] = useState("");
+  const [manualAwardDate, setManualAwardDate] = useState(new Date().toISOString().slice(0, 10));
+  const [manualAwardMethod, setManualAwardMethod] = useState("bank_transfer");
+  const [manualAwardDestination, setManualAwardDestination] = useState("");
+  const [awardingPayout, setAwardingPayout] = useState(false);
 
-  const loadSnapshot = async () => {
-    setLoading(true);
+  const reconciliationPayments = snapshot?.payments.filter((payment) =>
+    ["pending", "expired", "unmatched", "failed", "refunded"].includes(
+      payment.status,
+    ),
+  ) ?? [];
+
+  const loadSnapshot = useCallback(async (background = false) => {
+    if (!background) setLoading(true);
     setError("");
     const {
       data: { session },
@@ -343,6 +423,48 @@ export default function Admin({ section }: { section?: AdminSection }) {
       setError("The admin snapshot could not be loaded.");
     } else {
       const snapshotData = normalizeSnapshot(data as Partial<Snapshot>);
+      if (!section && !accountVisitInitialized.current) {
+        accountVisitInitialized.current = true;
+        const activeAccountIds = snapshotData.accounts
+          .filter((account) => ["active", "funded"].includes(account.status))
+          .map((account) => account.id);
+        const storageKey = `primepipstrading:admin-active-accounts:${session.user.id}`;
+        let previousAccountIds: string[] | null = null;
+
+        try {
+          const storedIds = localStorage.getItem(storageKey);
+          if (storedIds !== null) {
+            const parsedIds: unknown = JSON.parse(storedIds);
+            if (
+              Array.isArray(parsedIds) &&
+              parsedIds.every((id) => typeof id === "string")
+            ) {
+              previousAccountIds = parsedIds;
+            } else {
+              setAccountVisitTrackingError(
+                "Saved account history was invalid; tracking restarted.",
+              );
+            }
+          }
+        } catch {
+          setAccountVisitTrackingError(
+            "Saved account history could not be read; tracking restarted.",
+          );
+        }
+
+        if (previousAccountIds !== null) {
+          setAccountVisitChanges(
+            getAccountVisitChanges(previousAccountIds, activeAccountIds),
+          );
+        }
+        try {
+          localStorage.setItem(storageKey, JSON.stringify(activeAccountIds));
+        } catch {
+          setAccountVisitTrackingError(
+            "Account changes could not be saved for your next visit.",
+          );
+        }
+      }
       setSnapshot({
         ...snapshotData,
         coupons: couponError ? snapshotData.coupons : (couponData as Coupon[]),
@@ -350,33 +472,46 @@ export default function Admin({ section }: { section?: AdminSection }) {
       if (couponError) setError("Purchase coupons could not be loaded.");
     }
     setLoading(false);
-  };
+  }, [navigate, section]);
 
   useEffect(() => {
     void loadSnapshot();
 
     const refreshWhenVisible = () => {
-      if (document.visibilityState === "visible") void loadSnapshot();
+      if (document.visibilityState === "visible") void loadSnapshot(true);
     };
-    const refreshInterval = window.setInterval(refreshWhenVisible, 15000);
+    const refreshInterval = window.setInterval(refreshWhenVisible, 5000);
     window.addEventListener("focus", refreshWhenVisible);
 
     return () => {
       window.clearInterval(refreshInterval);
       window.removeEventListener("focus", refreshWhenVisible);
     };
-  }, []);
+  }, [loadSnapshot]);
 
-  const updateAffiliateStatus = async (user: User) => {
+  const updateAffiliateStatus = async (user: User, codeOverride?: string) => {
     setUpdatingAffiliate(user.id);
+    setError("");
+    const isAssigning = !user.isAffiliate;
+    const code = codeOverride?.trim().toUpperCase();
+    if (isAssigning && !code) {
+      setError("Enter a code before assigning affiliate access.");
+      setUpdatingAffiliate(null);
+      return;
+    }
+
     const { error: updateError } = await supabase.functions.invoke(
       "admin-affiliate",
       {
-        body: { userId: user.id, affiliate: !user.isAffiliate },
+        body: {
+          userId: user.id,
+          affiliate: isAssigning,
+          ...(isAssigning ? { code, discountPercent: 10, isActive: true } : {}),
+        },
       },
     );
     if (updateError) {
-      setError("The affiliate status could not be updated.");
+      setError(updateError.message || "The affiliate status could not be updated.");
     } else {
       setSnapshot((current) =>
         current
@@ -384,12 +519,15 @@ export default function Admin({ section }: { section?: AdminSection }) {
               ...current,
               users: current.users.map((candidate) =>
                 candidate.id === user.id
-                  ? { ...candidate, isAffiliate: !user.isAffiliate }
+                  ? { ...candidate, isAffiliate: isAssigning }
                   : candidate,
               ),
             }
           : current,
       );
+      if (isAssigning) {
+        setAffiliateAssignDrafts((current) => ({ ...current, [user.id]: "" }));
+      }
     }
     setUpdatingAffiliate(null);
   };
@@ -444,6 +582,7 @@ export default function Admin({ section }: { section?: AdminSection }) {
       "admin-account",
       {
         body: {
+          action: "grant",
           userId: grantUserId,
           challengeType: grantChallenge,
           accountSize: Number(grantSize),
@@ -498,8 +637,19 @@ export default function Admin({ section }: { section?: AdminSection }) {
         },
       },
     );
-    if (updateError || !data?.account)
-      setError(updateError?.message || "The account could not be updated.");
+    if (updateError || !data?.account) {
+      let message = data?.error || updateError?.message || "The account could not be updated.";
+      if (updateError instanceof FunctionsHttpError) {
+        const responseText = await updateError.context.text();
+        try {
+          const responseBody = JSON.parse(responseText) as { error?: string };
+          message = responseBody.error || message;
+        } catch {
+          message = responseText || message;
+        }
+      }
+      setError(message);
+    }
     else {
       setSnapshot((current) =>
         current
@@ -521,7 +671,7 @@ export default function Admin({ section }: { section?: AdminSection }) {
   const deleteAccount = async (account: Account) => {
     if (
       !window.confirm(
-        `Delete account ${account.id.slice(0, 8)}? This cannot be undone.`,
+        `Archive account ${account.id.slice(0, 8)}? It can be restored by an admin for 30 days.`,
       )
     )
       return;
@@ -538,7 +688,7 @@ export default function Admin({ section }: { section?: AdminSection }) {
       },
     );
     if (deleteError || !data?.deleted)
-      setError(deleteError?.message || "The account could not be deleted.");
+      setError(deleteError?.message || "The account could not be archived.");
     else {
       setSnapshot((current) =>
         current
@@ -555,6 +705,90 @@ export default function Admin({ section }: { section?: AdminSection }) {
     setDeletingAccount(null);
   };
 
+  const restoreAccount = async (account: Account) => {
+    setDeletingAccount(account.id);
+    setError("");
+    const { data, error: restoreError } = await supabase.functions.invoke(
+      "admin-account",
+      { body: { action: "restore", accountId: account.id, userId: account.user_id } },
+    );
+    if (restoreError || !data?.restored) {
+      setError(restoreError?.message || "The account could not be restored.");
+    } else {
+      setSnapshot((current) => current ? {
+        ...current,
+        accounts: current.accounts.map((candidate) =>
+          candidate.id === account.id
+            ? { ...candidate, archived_at: null, archive_expires_at: null }
+            : candidate,
+        ),
+      } : current);
+    }
+    setDeletingAccount(null);
+  };
+
+  const deleteArchivedAccount = async (account: Account) => {
+    if (!window.confirm(`Delete archived account ${account.id.slice(0, 8)} permanently? This removes the account immediately and cannot be undone.`)) return;
+
+    setDeletingAccount(account.id);
+    setError("");
+    const { data, error: deleteError } = await supabase.functions.invoke(
+      "admin-account",
+      { body: { action: "delete-archived", accountId: account.id, userId: account.user_id } },
+    );
+    if (deleteError || !data?.deleted) {
+      setError(deleteError?.message || "The archived account could not be permanently deleted.");
+    } else {
+      setSnapshot((current) => current ? {
+        ...current,
+        accounts: current.accounts.filter((candidate) => candidate.id !== account.id),
+      } : current);
+      if (editingAccount?.id === account.id) setEditingAccount(null);
+    }
+    setDeletingAccount(null);
+  };
+
+  const deleteAllArchivedAccounts = async () => {
+    const archivedCount = archivedAccounts.length;
+    if (!archivedCount) return;
+    if (!window.confirm(`Permanently delete all ${archivedCount} archived accounts? This cannot be undone.`)) return;
+
+    setDeletingAllArchived(true);
+    setError("");
+    const deletedAccountIds = new Set<string>();
+    const failures: string[] = [];
+    for (const account of archivedAccounts) {
+      const { data, error: deleteError } = await supabase.functions.invoke(
+        "admin-account",
+        {
+          body: {
+            action: "delete-archived",
+            accountId: account.id,
+            userId: account.user_id,
+          },
+        },
+      );
+      if (deleteError || !data?.deleted) {
+        failures.push(
+          `${account.id.slice(0, 8)}: ${data?.error || deleteError?.message || "Delete failed"}`,
+        );
+      } else {
+        deletedAccountIds.add(account.id);
+      }
+    }
+    setSnapshot((current) => current ? {
+      ...current,
+      accounts: current.accounts.filter((account) => !deletedAccountIds.has(account.id)),
+    } : current);
+    if (editingAccount && deletedAccountIds.has(editingAccount.id)) setEditingAccount(null);
+    if (failures.length) {
+      setError(
+        `${deletedAccountIds.size} archived account${deletedAccountIds.size === 1 ? "" : "s"} deleted; ${failures.length} could not be deleted: ${failures.join("; ")}`,
+      );
+    }
+    setDeletingAllArchived(false);
+  };
+
   const deleteTrader = async () => {
     const user = snapshot?.users.find(
       (candidate) => candidate.id === deleteUserId,
@@ -565,7 +799,7 @@ export default function Admin({ section }: { section?: AdminSection }) {
     }
     if (
       !window.confirm(
-        `Delete ${user.email || user.name || "this trader"}? This cannot be undone.`,
+        `Archive all accounts for ${user.email || user.name || "this trader"}? They can be restored by an admin for 30 days.`,
       )
     )
       return;
@@ -577,8 +811,8 @@ export default function Admin({ section }: { section?: AdminSection }) {
         body: { action: "delete-user", userId: user.id },
       },
     );
-    if (deleteError || !data?.deleted)
-      setError(deleteError?.message || "The trader could not be deleted.");
+    if (deleteError || !data?.archived)
+      setError(deleteError?.message || "The trader accounts could not be archived.");
     else {
       setSnapshot((current) =>
         current
@@ -642,8 +876,13 @@ export default function Admin({ section }: { section?: AdminSection }) {
   const resetCouponForm = () => {
     setEditingCoupon(null);
     setCouponCode("");
+    setCouponType("discount");
     setCouponDiscount("10");
     setCouponTypes([]);
+    setCouponPayPercent("75");
+    setCouponBonusChallenge("instant");
+    setCouponBonusSizeMode("same_as_primary");
+    setCouponBonusSize("5000");
     setCouponExpires("");
     setCouponMaxUses("");
     setCouponActive(true);
@@ -652,14 +891,23 @@ export default function Admin({ section }: { section?: AdminSection }) {
   const startEditingCoupon = (coupon: Coupon) => {
     setEditingCoupon(coupon);
     setCouponCode(coupon.code);
+    setCouponType(coupon.coupon_type ?? "discount");
     setCouponDiscount(String(coupon.discount_percent));
     setCouponTypes(coupon.challenge_types ?? []);
+    setCouponPayPercent(String(coupon.pay_percent ?? 75));
+    setCouponBonusChallenge(coupon.bonus_challenge_type ?? "instant");
+    setCouponBonusSizeMode(coupon.bonus_size_mode ?? "same_as_primary");
+    setCouponBonusSize(String(coupon.bonus_account_size ?? 5000));
     setCouponExpires(coupon.expires_at ? coupon.expires_at.slice(0, 10) : "");
     setCouponMaxUses(coupon.max_uses === null ? "" : String(coupon.max_uses));
     setCouponActive(coupon.is_active);
   };
 
   const saveCoupon = async () => {
+    if (couponType === "bogo" && couponTypes.length !== 1) {
+      setError("Select exactly one purchased account type for a BOGO coupon.");
+      return;
+    }
     setSavingCoupon(true);
     setError("");
     const { data, error: saveError } = await supabase.functions.invoke("admin-coupon", {
@@ -667,8 +915,13 @@ export default function Admin({ section }: { section?: AdminSection }) {
         action: editingCoupon ? "update" : "create",
         id: editingCoupon?.id,
         code: couponCode,
+        couponType,
         discountPercent: Number(couponDiscount),
+        payPercent: Number(couponPayPercent),
         challengeTypes: couponTypes.length ? couponTypes : null,
+        bonusChallengeType: couponBonusChallenge,
+        bonusSizeMode: couponBonusSizeMode,
+        bonusAccountSize: couponBonusSize,
         expiresAt: couponExpires ? `${couponExpires}T23:59:59.000Z` : null,
         maxUses: couponMaxUses,
         isActive: couponActive,
@@ -716,13 +969,26 @@ export default function Admin({ section }: { section?: AdminSection }) {
       return;
     }
     setReviewingKyc(application.id);
-    const { data, error: reviewError } = await supabase.rpc("review_kyc", {
-      p_kyc_id: application.id,
-      p_status: status,
-      p_rejection_reason: reason || null,
+    const { data, error: reviewError } = await supabase.functions.invoke("admin-kyc-review", {
+      body: {
+        kycId: application.id,
+        status,
+        rejectionReason: reason || null,
+      },
     });
-    if (reviewError) setError(reviewError.message);
-    else
+    if (reviewError) {
+      let message = reviewError.message;
+      if (reviewError instanceof FunctionsHttpError) {
+        const responseText = await reviewError.context.text();
+        try {
+          const responseBody = JSON.parse(responseText) as { error?: string };
+          if (responseBody.error) message = responseBody.error;
+        } catch {
+          // Keep the generic invocation error when the response is not JSON.
+        }
+      }
+      setError(message);
+    } else
       setSnapshot((current) =>
         current
           ? {
@@ -730,28 +996,65 @@ export default function Admin({ section }: { section?: AdminSection }) {
               kyc: current.kyc.map((item) =>
                 item.id === application.id ? data : item,
               ),
+              kycDocuments: current.kycDocuments.filter(
+                (document) => document.kyc_id !== application.id,
+              ),
             }
           : current,
       );
     setReviewingKyc(null);
   };
 
-  const reviewPayout = async (payout: Payout, status: "approved" | "rejected") => {
+  const reviewPayout = async (payout: Payout, status: "approved" | "rejected" | "paid", rejectionReason = "") => {
+    if (status === "rejected" && rejectionReason.trim().length < 3) {
+      setError("A rejection reason is required before declining a payout.");
+      return;
+    }
     setReviewingPayout(payout.id);
     setError("");
     const { data, error: reviewError } = await supabase.functions.invoke("admin-payout", {
-      body: { payoutId: payout.id, status },
+      body: { payoutId: payout.id, status, rejectionReason: rejectionReason.trim() },
     });
     if (reviewError || !data?.payout) {
       setError(reviewError?.message || "The payout request could not be reviewed.");
     } else {
       setSnapshot((current) => current ? {
         ...current,
-        payouts: current.payouts.map((item) => item.id === payout.id ? { ...item, status, updated_at: data.payout.updated_at, reviewed_by: data.payout.reviewed_by, reviewed_at: data.payout.reviewed_at } : item),
+        payouts: current.payouts.map((item) => item.id === payout.id ? { ...item, status, rejection_reason: data.payout.rejection_reason ?? null, updated_at: data.payout.updated_at, reviewed_by: data.payout.reviewed_by, reviewed_at: data.payout.reviewed_at } : item),
       } : current);
       setSelectedPayout(null);
+      setPayoutRejectionReason("");
     }
     setReviewingPayout(null);
+  };
+
+  const awardManualPayout = async () => {
+    if (!manualAwardUserId || !manualAwardAmount || !manualAwardDate || !manualAwardDestination.trim()) {
+      setError("Select a trader and provide the payout date, payout amount, and destination.");
+      return;
+    }
+    setAwardingPayout(true);
+    setError("");
+    const { data, error: awardError } = await supabase.functions.invoke("admin-award-payout", {
+      body: {
+        userId: manualAwardUserId,
+        accountSize: Number(manualAwardSize),
+        challengeType: manualAwardChallenge,
+        amount: Number(manualAwardAmount),
+        payoutDate: new Date(`${manualAwardDate}T12:00:00`).toISOString(),
+        method: manualAwardMethod,
+        destination: manualAwardDestination,
+      },
+    });
+    if (awardError || !data?.payout) {
+      setError(data?.error || awardError?.message || "The manual payout could not be awarded.");
+    } else {
+      setSnapshot((current) => current ? { ...current, payouts: [data.payout as Payout, ...current.payouts] } : current);
+      setManualAwardOpen(false);
+      setManualAwardAmount("");
+      setManualAwardDestination("");
+    }
+    setAwardingPayout(false);
   };
 
   const previewDocument = async (path: string | null) => {
@@ -780,21 +1083,27 @@ export default function Admin({ section }: { section?: AdminSection }) {
     const results = await Promise.all(
       positions.map(async (position) => {
         const asset = position.assets;
-        const price = asset ? prices[asset.symbol] : undefined;
-        const exitPrice = price
-          ? position.position_type.toLowerCase() === "buy"
-            ? price.bid
-            : price.ask
-          : null;
-        if (!exitPrice)
-          return {
-            error: `${asset?.symbol || position.id}: live price unavailable`,
-          };
-        const { error: closeError } = await supabase.rpc("close_trade", {
-          p_account_id: position.account_id,
-          p_position_id: position.id,
-          p_exit_price: exitPrice,
+        const { error: closeError } = await supabase.functions.invoke("trade-execution", {
+          body: {
+            action: "close",
+            accountId: position.account_id,
+            positionId: position.id,
+            requestId: crypto.randomUUID(),
+          },
         });
+        if (closeError instanceof FunctionsHttpError) {
+          const responseText = await closeError.context.text();
+          try {
+            const responseBody = JSON.parse(responseText) as { error?: string };
+            return {
+              error: `${asset?.symbol || position.id}: ${responseBody.error || closeError.message}`,
+            };
+          } catch {
+            return {
+              error: `${asset?.symbol || position.id}: ${responseText || closeError.message}`,
+            };
+          }
+        }
         return closeError
           ? { error: `${asset?.symbol || position.id}: ${closeError.message}` }
           : { error: null };
@@ -818,10 +1127,13 @@ export default function Admin({ section }: { section?: AdminSection }) {
   };
 
   const purchasedAccounts = (snapshot?.accounts ?? []).filter(
-    isPurchasedAccount,
+    (account) => !account.archived_at && ["pending_payment", "active", "funded", "passed", "failed"].includes(account.status),
   );
   const failedAccounts = (snapshot?.accounts ?? []).filter(
-    (account) => account.status === "failed",
+    (account) => account.status === "failed" && !account.archived_at,
+  );
+  const archivedAccounts = (snapshot?.accounts ?? []).filter(
+    (account) => Boolean(account.archived_at),
   );
   const userMap = useMemo(
     () => new Map((snapshot?.users ?? []).map((user) => [user.id, user])),
@@ -840,6 +1152,17 @@ export default function Admin({ section }: { section?: AdminSection }) {
     () => new Map(purchasedAccounts.map((account) => [account.id, account])),
     [purchasedAccounts],
   );
+  const paymentByAccount = useMemo(() => {
+    const entries = new Map<string, Payment>();
+    for (const payment of snapshot?.payments ?? []) {
+      if (!payment.account_id) continue;
+      const current = entries.get(payment.account_id);
+      if (!current || new Date(payment.checkout_at).getTime() > new Date(current.checkout_at).getTime()) {
+        entries.set(payment.account_id, payment);
+      }
+    }
+    return entries;
+  }, [snapshot]);
   const activeUsers = (snapshot?.users ?? []).filter(
     (user) =>
       user.lastSignInAt &&
@@ -915,7 +1238,7 @@ export default function Admin({ section }: { section?: AdminSection }) {
 
   const pageTitle =
     section === "traders"
-      ? "Trader activity"
+      ? "Traders"
       : section === "exposure"
         ? "Trading exposure"
         : section === "referrals"
@@ -930,9 +1253,11 @@ export default function Admin({ section }: { section?: AdminSection }) {
                   ? "Payment reconciliation"
                   : section === "payouts"
                     ? "Payout requests"
-                    : section === "coupons"
-                      ? "Purchase coupons"
-                      : "Platform overview";
+                    : section === "purchases"
+                      ? "Purchased accounts"
+                      : section === "coupons"
+                        ? "Purchase coupons"
+                        : "Platform overview";
 
   const statCards = [
     {
@@ -944,7 +1269,11 @@ export default function Admin({ section }: { section?: AdminSection }) {
     {
       label: "Active accounts",
       value: activeAccounts.length,
-      detail: `${purchasedAccounts.length} purchased accounts`,
+      detail: accountVisitTrackingError
+        ? `${purchasedAccounts.length} purchased accounts · ${accountVisitTrackingError}`
+        : accountVisitChanges
+          ? `${purchasedAccounts.length} purchased accounts · ${accountVisitChanges.added} added · ${accountVisitChanges.removed} removed since last visit`
+          : `${purchasedAccounts.length} purchased accounts · tracking starts from this visit`,
       icon: WalletCards,
     },
     {
@@ -967,7 +1296,7 @@ export default function Admin({ section }: { section?: AdminSection }) {
       title={pageTitle}
       subtitle="Live platform oversight and trader activity"
     >
-      <div className="space-y-6">
+      <div className="w-full min-w-0 max-w-full space-y-6">
         <div className="flex flex-wrap items-end justify-between gap-4">
           <div className="min-w-0">
             <div className="mb-2 flex items-center gap-2 text-primary">
@@ -1060,8 +1389,8 @@ export default function Admin({ section }: { section?: AdminSection }) {
                         </Badge>
                       </CardTitle>
                       <p className="text-sm text-muted-foreground">
-                        Reset a failed account for the trader to start over, or
-                        remove it from their account list.
+                        Failed accounts are archived automatically. Restore an
+                        archived account before resetting it for the trader.
                       </p>
                     </CardHeader>
                     <CardContent className="space-y-3">
@@ -1109,21 +1438,6 @@ export default function Admin({ section }: { section?: AdminSection }) {
                                   </>
                                 )}
                               </Button>
-                              <Button
-                                size="sm"
-                                variant="destructive"
-                                onClick={() => void deleteAccount(account)}
-                                disabled={isBusy}
-                              >
-                                {deletingAccount === account.id ? (
-                                  "Deleting..."
-                                ) : (
-                                  <>
-                                    <Trash2 className="mr-2 h-3.5 w-3.5" />
-                                    Delete account
-                                  </>
-                                )}
-                              </Button>
                             </div>
                           </div>
                         );
@@ -1131,6 +1445,73 @@ export default function Admin({ section }: { section?: AdminSection }) {
                     </CardContent>
                   </Card>
                 )}
+
+              {(!section || section === "traders") && archivedAccounts.length > 0 && (
+                <Card className="border-amber-500/40">
+                  <CardHeader>
+                    <CardTitle className="flex items-center justify-between gap-3 text-xl">
+                      <span className="flex items-center gap-2">
+                        <Archive className="h-5 w-5 text-amber-600" />
+                        Archived accounts
+                      </span>
+                      <Badge variant="outline">{archivedAccounts.length}</Badge>
+                    </CardTitle>
+                    <p className="text-sm text-muted-foreground">
+                      Failed accounts are archived automatically and permanently deleted 3 days after failure. Other archived accounts are permanently deleted after 30 days.
+                    </p>
+                  </CardHeader>
+                  <CardContent className="space-y-3">
+                    <div className="flex justify-end">
+                      <Button
+                        size="sm"
+                        variant="destructive"
+                        onClick={() => void deleteAllArchivedAccounts()}
+                        disabled={deletingAllArchived || deletingAccount !== null}
+                      >
+                        <Trash2 className="mr-2 h-3.5 w-3.5" />
+                        {deletingAllArchived ? "Deleting..." : "Delete all"}
+                      </Button>
+                    </div>
+                    {archivedAccounts.map((account) => {
+                      const user = userMap.get(account.user_id);
+                      return (
+                        <div key={account.id} className="flex flex-col gap-4 rounded-lg border border-border p-4 md:flex-row md:items-center md:justify-between">
+                          <div>
+                            <div className="flex flex-wrap items-center gap-2">
+                              <p className="font-medium">{user?.name || user?.email || "Unnamed trader"}</p>
+                              <Badge variant="outline">Archived</Badge>
+                            </div>
+                            <p className="mt-1 text-xs text-muted-foreground">
+                              {account.challenge_type.replace("_", " ")} · ${money(account.account_size)} ·
+                              {account.archive_expires_at ? ` permanently deleted ${date(account.archive_expires_at)}` : " pending deletion"}
+                            </p>
+                          </div>
+                          <div className="flex flex-wrap gap-2">
+                            {account.status === "failed" && (
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                onClick={() => void resetAccount(account)}
+                                disabled={deletingAllArchived || deletingAccount === account.id || resettingAccount === account.id}
+                              >
+                                {resettingAccount === account.id ? "Resetting..." : "Reset account"}
+                              </Button>
+                            )}
+                            <Button size="sm" variant="outline" onClick={() => void restoreAccount(account)} disabled={deletingAllArchived || deletingAccount === account.id}>
+                              <RefreshCw className="mr-2 h-3.5 w-3.5" />
+                              {deletingAccount === account.id ? "Restoring..." : "Restore account"}
+                            </Button>
+                            <Button size="sm" variant="destructive" onClick={() => void deleteArchivedAccount(account)} disabled={deletingAllArchived || deletingAccount === account.id}>
+                              <Trash2 className="mr-2 h-3.5 w-3.5" />
+                              {deletingAccount === account.id ? "Deleting..." : "Delete permanently"}
+                            </Button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </CardContent>
+                </Card>
+              )}
 
               {(!section || section === "traders") && (
                 <Card>
@@ -1437,15 +1818,22 @@ export default function Admin({ section }: { section?: AdminSection }) {
                                 </div>
                               </td>
                               <td className="px-4 py-3">
-                                <Badge
-                                  variant={
-                                    account.status === "failed"
-                                      ? "destructive"
-                                      : "outline"
-                                  }
-                                >
-                                  {account.status.replace("_", " ")}
-                                </Badge>
+                                <div className="flex flex-wrap gap-1">
+                                  <Badge
+                                    variant={
+                                      account.status === "failed"
+                                        ? "destructive"
+                                        : "outline"
+                                    }
+                                  >
+                                    {account.status.replace("_", " ")}
+                                  </Badge>
+                                  {account.risk_monitoring_degraded && (
+                                    <Badge variant="destructive" title="New trading is paused until risk quotes are available again">
+                                      Risk quotes unavailable
+                                    </Badge>
+                                  )}
+                                </div>
                               </td>
                               <td className="px-4 py-3">
                                 {money(account.current_balance ?? 0)}
@@ -1474,6 +1862,139 @@ export default function Admin({ section }: { section?: AdminSection }) {
                 </Card>
               )}
 
+              {(!section || section === "purchases") && (
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="flex items-center gap-2 text-xl">
+                      <WalletCards className="h-5 w-5 text-primary" />
+                      Purchased accounts
+                    </CardTitle>
+                    <p className="text-sm text-muted-foreground">
+                      Purchased and granted accounts with their purchase metadata and any BOGO parent/bonus relationship.
+                    </p>
+                  </CardHeader>
+                  <CardContent className="p-0">
+                    <div className="overflow-x-auto">
+                      <table className="min-w-[76rem] w-full text-left text-sm">
+                        <thead className="border-y border-border bg-secondary/40 text-xs uppercase text-muted-foreground">
+                          <tr>
+                            <th className="px-4 py-3">Trader</th>
+                            <th className="px-4 py-3">Account</th>
+                            <th className="px-4 py-3">Status</th>
+                            <th className="px-4 py-3">Purchase amount</th>
+                            <th className="px-4 py-3">Payment</th>
+                            <th className="px-4 py-3">Purchased</th>
+                            <th className="px-4 py-3">Coupon</th>
+                            <th className="px-4 py-3 text-right">Action</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {[...purchasedAccounts]
+                            .sort((firstAccount, secondAccount) =>
+                              new Date(secondAccount.created_at).getTime() - new Date(firstAccount.created_at).getTime(),
+                            )
+                            .map((account) => {
+                              const user = userMap.get(account.user_id);
+                              const payment = paymentByAccount.get(account.id);
+                              const isBonusAccount = Boolean(account.bonus_of_account_id);
+                              const purchaseAmount = isBonusAccount
+                                ? 0
+                                : Number(account.payment_amount_local ?? account.price ?? payment?.amount ?? 0);
+                              const purchaseCurrency = (account.payment_currency || payment?.currency || "USD").toUpperCase();
+                              const paymentStatus = isBonusAccount
+                                ? "granted"
+                                : payment?.status === "success"
+                                  ? "paid"
+                                  : payment?.status === "failed"
+                                    ? "failed"
+                                    : payment?.status === "pending"
+                                      ? "pending"
+                                      : account.status === "failed"
+                                        ? "failed"
+                                        : account.status === "pending_payment"
+                                          ? "pending"
+                                          : account.status === "active" || account.status === "funded" || account.status === "passed"
+                                            ? "paid"
+                                            : "—";
+                              const paymentReference = isBonusAccount
+                                ? `Bonus of ${account.bonus_of_account_id?.slice(0, 8)}`
+                                : account.payment_reference || payment?.provider_reference || "No payment reference";
+                              const isPaidPurchase = !isBonusAccount && (account.status === "active" || account.status === "funded" || account.status === "passed" || payment?.status === "success");
+                              const phaseRules = getPhaseRules(account.challenge_type, account.current_phase);
+                              const failedDrawdownReason =
+                                account.status === "failed"
+                                  ? ((account.violation_type === "daily_drawdown" || (typeof account.daily_drawdown_percent === "number" && account.daily_drawdown_percent >= phaseRules.dailyDrawdown))
+                                      ? "Daily drawdown limit breached."
+                                      : (account.violation_type === "max_drawdown" || (typeof account.max_drawdown_percent === "number" && account.max_drawdown_percent >= phaseRules.maxDrawdown))
+                                        ? "Max drawdown limit breached."
+                                        : "Account was marked as failed.")
+                                  : null;
+                              const paymentFailureReason =
+                                failedDrawdownReason ||
+                                (isPaidPurchase ? null : payment?.failure_reason || null);
+                              const displayCurrency = purchaseCurrency === "USD" ? "$" : purchaseCurrency === "NGN" ? "₦" : purchaseCurrency + " ";
+                              return (
+                                <tr key={account.id} className="border-b border-border/60 last:border-0 align-top">
+                                  <td className="px-4 py-3">
+                                    <div className="font-medium">{user?.name || "Unnamed trader"}</div>
+                                    <div className="text-xs text-muted-foreground">{user?.email || account.user_id.slice(0, 8)}</div>
+                                  </td>
+                                  <td className="px-4 py-3">
+                                    <div>${account.account_size.toLocaleString()} · {account.challenge_type.replace("_", " ")}</div>
+                                    <div className="font-mono text-[10px] text-muted-foreground">{account.id.slice(0, 8)}</div>
+                                    {isBonusAccount ? (
+                                      <div className="text-[10px] font-medium text-primary">BOGO bonus · parent {account.bonus_of_account_id?.slice(0, 8)}</div>
+                                    ) : account.bogo_bonus_challenge_type && account.bogo_bonus_account_size ? (
+                                      <div className="text-[10px] font-medium text-primary">
+                                        BOGO includes ${account.bogo_bonus_account_size.toLocaleString()} {account.bogo_bonus_challenge_type.replace("_", " ")}
+                                      </div>
+                                    ) : null}
+                                  </td>
+                                  <td className="px-4 py-3">
+                                    <Badge variant={account.status === "failed" ? "destructive" : "outline"}>
+                                      {account.status.replace("_", " ")}
+                                    </Badge>
+                                  </td>
+                                  <td className="px-4 py-3">
+                                    <div className="font-medium">{displayCurrency === "$" ? money(purchaseAmount) : `${displayCurrency}${purchaseAmount.toLocaleString()}`}</div>
+                                    <div className="text-[10px] text-muted-foreground">{isBonusAccount ? "Bonus account · no charge" : `Paid in ${purchaseCurrency}`}</div>
+                                  </td>
+                                  <td className="px-4 py-3 text-xs text-muted-foreground">
+                                    <div className="font-medium text-foreground">{isBonusAccount ? "BOGO BONUS" : (account.payment_provider || payment?.provider || "No payment").toUpperCase()}</div>
+                                    <div className="mt-1">Status: {paymentStatus}</div>
+                                    <div>Ref: {paymentReference}</div>
+                                    {paymentFailureReason && <div className="mt-1 text-destructive">Failure: {paymentFailureReason}</div>}
+                                    {payment && (
+                                      <div className="mt-1 space-y-0.5">
+                                        {payment.checkout_at ? <span>Checked out: {date(payment.checkout_at)}</span> : null}
+                                        {payment.verified_at && <span>Verified: {date(payment.verified_at)}</span>}
+                                        {payment.webhook_at && <span>Webhook: {date(payment.webhook_at)}</span>}
+                                        {payment.refund_amount !== null && payment.refund_amount !== undefined && <span>Refund: {money(Number(payment.refund_amount))}</span>}
+                                      </div>
+                                    )}
+                                  </td>
+                                  <td className="px-4 py-3 text-xs text-muted-foreground">{date(account.created_at)}</td>
+                                  <td className="px-4 py-3">
+                                    <span className="text-xs font-medium text-foreground">{isBonusAccount ? "BOGO bonus grant" : formatCouponUsage(account.coupon_code)}</span>
+                                  </td>
+                                  <td className="px-4 py-3 text-right">
+                                    <Button size="sm" variant="destructive" onClick={() => void deleteAccount(account)} disabled={deletingAccount === account.id}>
+                                      {deletingAccount === account.id ? "Archiving..." : "Archive"}
+                                    </Button>
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                        </tbody>
+                      </table>
+                    </div>
+                    {purchasedAccounts.length === 0 && (
+                      <p className="p-6 text-sm text-muted-foreground">No purchased accounts have been recorded yet.</p>
+                    )}
+                  </CardContent>
+                </Card>
+              )}
+
               {(!section || section === "coupons") && (
                 <Card>
                   <CardHeader>
@@ -1482,7 +2003,7 @@ export default function Admin({ section }: { section?: AdminSection }) {
                       {editingCoupon ? "Edit purchase coupon" : "Add purchase coupon"}
                     </CardTitle>
                     <p className="text-sm text-muted-foreground">
-                      Leave account types unchecked to make the coupon valid for every purchase.
+                      Standard coupons apply a discount. BOGO coupons discount one eligible purchase and grant a linked bonus account after successful payment.
                     </p>
                   </CardHeader>
                   <CardContent className="space-y-4">
@@ -1492,9 +2013,27 @@ export default function Admin({ section }: { section?: AdminSection }) {
                         <Input id="coupon-code" value={couponCode} onChange={(event) => setCouponCode(event.target.value.toUpperCase())} placeholder="WELCOME25" maxLength={32} />
                       </div>
                       <div className="space-y-2">
-                        <Label htmlFor="coupon-discount">Discount percent</Label>
-                        <Input id="coupon-discount" type="number" min="1" max="100" value={couponDiscount} onChange={(event) => setCouponDiscount(event.target.value)} />
+                        <Label>Coupon type</Label>
+                        <Select value={couponType} onValueChange={(value: "discount" | "bogo") => setCouponType(value)}>
+                          <SelectTrigger><SelectValue /></SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="discount">Standard discount</SelectItem>
+                            <SelectItem value="bogo">Buy one, get one</SelectItem>
+                          </SelectContent>
+                        </Select>
                       </div>
+                      {couponType === "bogo" ? (
+                        <div className="space-y-2">
+                          <Label htmlFor="coupon-pay-percent">Customer pays (%)</Label>
+                          <Input id="coupon-pay-percent" type="number" min="1" max="100" step="0.01" value={couponPayPercent} onChange={(event) => setCouponPayPercent(event.target.value)} />
+                          <p className="text-xs text-muted-foreground">For BOGO75, enter 75: the customer pays 75% of the primary account price.</p>
+                        </div>
+                      ) : (
+                        <div className="space-y-2">
+                          <Label htmlFor="coupon-discount">Discount percent</Label>
+                          <Input id="coupon-discount" type="number" min="1" max="100" value={couponDiscount} onChange={(event) => setCouponDiscount(event.target.value)} />
+                        </div>
+                      )}
                       <div className="space-y-2">
                         <Label htmlFor="coupon-expires">Expires on</Label>
                         <Input id="coupon-expires" type="date" value={couponExpires} onChange={(event) => setCouponExpires(event.target.value)} />
@@ -1504,22 +2043,76 @@ export default function Admin({ section }: { section?: AdminSection }) {
                         <Input id="coupon-max-uses" type="number" min="1" value={couponMaxUses} onChange={(event) => setCouponMaxUses(event.target.value)} placeholder="Unlimited" />
                       </div>
                     </div>
-                    <div className="space-y-3">
-                      <Label>Account types</Label>
-                      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-                        {([
-                          ["three_step", "3-Step Challenge"],
-                          ["two_step", "2-Step Challenge"],
-                          ["one_step", "1-Step Challenge"],
-                          ["instant", "Instant Funding"],
-                        ] as const).map(([value, label]) => (
-                          <label key={value} className="flex items-center gap-2 text-sm">
-                            <Checkbox checked={couponTypes.includes(value)} onCheckedChange={(checked) => setCouponTypes((current) => checked ? [...current, value] : current.filter((item) => item !== value))} />
-                            {label}
-                          </label>
-                        ))}
+                    {couponType === "bogo" ? (
+                      <div className="grid gap-4 md:grid-cols-3">
+                        <div className="space-y-2">
+                          <Label>Purchased account type</Label>
+                          <Select
+                            value={couponTypes[0] ?? "none"}
+                            onValueChange={(value) => setCouponTypes(value === "none" ? [] : [value as GrantChallenge])}
+                          >
+                            <SelectTrigger><SelectValue placeholder="Select account type" /></SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="none">Select account type</SelectItem>
+                              <SelectItem value="three_step">3-Step Challenge</SelectItem>
+                              <SelectItem value="two_step">2-Step Challenge</SelectItem>
+                              <SelectItem value="one_step">1-Step Challenge</SelectItem>
+                              <SelectItem value="instant">Instant Funding</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </div>
+                        <div className="space-y-2">
+                          <Label>Bonus account type</Label>
+                          <Select value={couponBonusChallenge} onValueChange={(value: GrantChallenge) => setCouponBonusChallenge(value)}>
+                            <SelectTrigger><SelectValue /></SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="three_step">3-Step Challenge</SelectItem>
+                              <SelectItem value="two_step">2-Step Challenge</SelectItem>
+                              <SelectItem value="one_step">1-Step Challenge</SelectItem>
+                              <SelectItem value="instant">Instant Funding</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </div>
+                        <div className="space-y-2">
+                          <Label>Bonus account size</Label>
+                          <Select value={couponBonusSizeMode} onValueChange={(value: "same_as_primary" | "fixed") => setCouponBonusSizeMode(value)}>
+                            <SelectTrigger><SelectValue /></SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="same_as_primary">Same as purchased account</SelectItem>
+                              <SelectItem value="fixed">Fixed account size</SelectItem>
+                            </SelectContent>
+                          </Select>
+                          {couponBonusSizeMode === "fixed" && (
+                            <Select value={couponBonusSize} onValueChange={setCouponBonusSize}>
+                              <SelectTrigger><SelectValue /></SelectTrigger>
+                              <SelectContent>
+                                {["5000", "10000", "25000", "50000", "100000", "200000"].map((size) => (
+                                  <SelectItem key={size} value={size}>${Number(size).toLocaleString()}</SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                          )}
+                        </div>
                       </div>
-                    </div>
+                    ) : (
+                      <div className="space-y-3">
+                        <Label>Eligible account types</Label>
+                        <p className="text-xs text-muted-foreground">Leave all unchecked to allow every account type.</p>
+                        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                          {([
+                            ["three_step", "3-Step Challenge"],
+                            ["two_step", "2-Step Challenge"],
+                            ["one_step", "1-Step Challenge"],
+                            ["instant", "Instant Funding"],
+                          ] as const).map(([value, label]) => (
+                            <label key={value} className="flex items-center gap-2 text-sm">
+                              <Checkbox checked={couponTypes.includes(value)} onCheckedChange={(checked) => setCouponTypes((current) => checked ? [...current, value] : current.filter((item) => item !== value))} />
+                              {label}
+                            </label>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                     <div className="flex flex-wrap items-center justify-between gap-3">
                       <label className="flex items-center gap-2 text-sm">
                         <Checkbox checked={couponActive} onCheckedChange={(checked) => setCouponActive(checked === true)} />
@@ -1544,15 +2137,25 @@ export default function Admin({ section }: { section?: AdminSection }) {
                   </CardHeader>
                   <CardContent className="p-0">
                     <div className="overflow-x-auto">
-                      <table className="min-w-[40rem] w-full text-left text-sm">
+                      <table className="min-w-[48rem] w-full text-left text-sm">
                         <thead className="border-y border-border bg-secondary/40 text-xs uppercase text-muted-foreground">
-                          <tr><th className="px-6 py-3">Code</th><th className="px-4 py-3">Discount</th><th className="px-4 py-3">Account types</th><th className="px-4 py-3">Usage</th><th className="px-4 py-3">Status</th><th className="px-6 py-3">Actions</th></tr>
+                          <tr><th className="px-6 py-3">Code</th><th className="px-4 py-3">Offer</th><th className="px-4 py-3">Account types</th><th className="px-4 py-3">Usage</th><th className="px-4 py-3">Status</th><th className="px-6 py-3">Actions</th></tr>
                         </thead>
                         <tbody>
                           {snapshot.coupons.map((coupon) => (
                             <tr key={coupon.id} className="border-b border-border/60 last:border-0">
                               <td className="px-6 py-4 font-mono font-semibold">{coupon.code}</td>
-                              <td className="px-4 py-4">{Number(coupon.discount_percent)}%</td>
+                              <td className="px-4 py-4 text-xs">
+                                {coupon.coupon_type === "bogo" ? (
+                                  <>
+                                    <div className="font-medium">BOGO · pay {coupon.pay_percent}%</div>
+                                    <div className="text-muted-foreground">
+                                      Get {coupon.bonus_size_mode === "same_as_primary" ? "same-size" : `$${Number(coupon.bonus_account_size).toLocaleString()}`}{" "}
+                                      {coupon.bonus_challenge_type?.replace("_", " ")} free
+                                    </div>
+                                  </>
+                                ) : `${Number(coupon.discount_percent)}% off`}
+                              </td>
                               <td className="px-4 py-4 text-xs">{coupon.challenge_types?.length ? coupon.challenge_types.map((type) => type.replace("_", " ")).join(", ") : "All account types"}</td>
                               <td className="px-4 py-4 text-xs">{coupon.times_used}{coupon.max_uses === null ? "" : ` / ${coupon.max_uses}`}</td>
                               <td className="px-4 py-4"><Badge variant={coupon.is_active ? "default" : "outline"}>{coupon.is_active ? "Active" : "Inactive"}</Badge></td>
@@ -1569,15 +2172,36 @@ export default function Admin({ section }: { section?: AdminSection }) {
 
               {(!section || section === "payments") && (
                 <Card>
-                  <CardHeader>
-                    <CardTitle className="flex items-center gap-2 text-xl">
-                      <CreditCard className="h-5 w-5 text-primary" />
-                      Payment reconciliation
-                    </CardTitle>
-                    <p className="text-sm text-muted-foreground">
-                      Review provider callbacks that need investigation or did
-                      not match a checkout order.
-                    </p>
+                  <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                    <div className="space-y-2">
+                      <CardTitle className="flex items-center gap-2 text-xl">
+                        <CreditCard className="h-5 w-5 text-primary" />
+                        Payment reconciliation
+                      </CardTitle>
+                      <p className="text-sm text-muted-foreground">
+                        Review pending orders and provider callbacks that need
+                        investigation or did not match a checkout order.
+                      </p>
+                    </div>
+                    {reconciliationPayments.length > 10 && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="shrink-0 self-start"
+                        aria-expanded={showAllPayments}
+                        onClick={() => setShowAllPayments((expanded) => !expanded)}
+                      >
+                        {showAllPayments
+                          ? "Show 10"
+                          : `Show all (${reconciliationPayments.length})`}
+                        <ChevronDown
+                          className={cn(
+                            "ml-2 h-4 w-4 transition-transform",
+                            showAllPayments && "rotate-180",
+                          )}
+                        />
+                      </Button>
+                    )}
                   </CardHeader>
                   <CardContent className="p-0">
                     <div className="overflow-x-auto">
@@ -1593,13 +2217,10 @@ export default function Admin({ section }: { section?: AdminSection }) {
                           </tr>
                         </thead>
                         <tbody>
-                          {snapshot.payments
-                            .filter((payment) =>
-                              ["unmatched", "failed", "refunded"].includes(
-                                payment.status,
-                              ),
-                            )
-                            .map((payment) => (
+                          {(showAllPayments
+                            ? reconciliationPayments
+                            : reconciliationPayments.slice(0, 10)
+                          ).map((payment) => (
                               <tr
                                 key={payment.id}
                                 className="border-b border-border/60 last:border-0"
@@ -1640,13 +2261,9 @@ export default function Admin({ section }: { section?: AdminSection }) {
                         </tbody>
                       </table>
                     </div>
-                    {snapshot.payments.filter((payment) =>
-                      ["unmatched", "failed", "refunded"].includes(
-                        payment.status,
-                      ),
-                    ).length === 0 && (
+                    {reconciliationPayments.length === 0 && (
                       <p className="p-6 text-sm text-muted-foreground">
-                        No unmatched, failed, or refunded payments.
+                        No pending or exceptional payments.
                       </p>
                     )}
                   </CardContent>
@@ -1656,13 +2273,20 @@ export default function Admin({ section }: { section?: AdminSection }) {
               {(!section || section === "payouts") && (
                 <Card>
                   <CardHeader>
-                    <CardTitle className="flex items-center gap-2 text-xl">
-                      <WalletCards className="h-5 w-5 text-primary" />
-                      Payout requests
-                    </CardTitle>
-                    <p className="text-sm text-muted-foreground">
-                      Review funded-account profit and referral commission withdrawals.
-                    </p>
+                    <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-start">
+                      <div>
+                        <CardTitle className="flex items-center gap-2 text-xl">
+                          <WalletCards className="h-5 w-5 text-primary" />
+                          Payout requests
+                        </CardTitle>
+                        <p className="mt-1 text-sm text-muted-foreground">
+                          Review withdrawals or issue a payout certificate manually.
+                        </p>
+                      </div>
+                      <Button variant="gold" onClick={() => setManualAwardOpen(true)}>
+                        <Award className="mr-2 h-4 w-4" />Award payout
+                      </Button>
+                    </div>
                   </CardHeader>
                   <CardContent className="p-0">
                     <div className="overflow-x-auto">
@@ -1686,9 +2310,10 @@ export default function Admin({ section }: { section?: AdminSection }) {
                                 {userMap.get(payout.user_id)?.email || payout.user_id.slice(0, 8)}
                               </td>
                               <td className="px-4 py-4">
-                                <Badge variant="outline">
-                                  {payout.source === "referral_commission" ? "Commission" : "Funded account"}
+                                <Badge variant={payout.auditFlag ? "destructive" : "outline"}>
+                                  {payout.source === "referral_commission" ? "Commission" : payout.source === "manual_award" ? "Manual award" : "Funded account"}
                                 </Badge>
+                                {payout.auditFlag && <p className="mt-1 text-[10px] font-medium text-destructive">Pre-funded or legacy</p>}
                               </td>
                               <td className="px-4 py-4 font-medium">{money(Number(payout.amount))}</td>
                               <td className="px-4 py-4 capitalize">{payout.method.replace("_", " ")}</td>
@@ -1702,8 +2327,11 @@ export default function Admin({ section }: { section?: AdminSection }) {
                                     <Button size="sm" variant="outline" onClick={() => void reviewPayout(payout, "approved")} disabled={reviewingPayout === payout.id}>
                                       <Check className="mr-1.5 h-3.5 w-3.5" />Approve
                                     </Button>
-                                    <Button size="sm" variant="destructive" onClick={() => void reviewPayout(payout, "rejected")} disabled={reviewingPayout === payout.id}>Decline</Button>
+                                    <Button size="sm" variant="destructive" onClick={() => { setSelectedPayout(payout); setPayoutRejectionReason(""); }} disabled={reviewingPayout === payout.id}>Decline</Button>
                                   </>}
+                                  {payout.status === "approved" && <Button size="sm" variant="gold" onClick={() => void reviewPayout(payout, "paid")} disabled={reviewingPayout === payout.id}>
+                                    <Check className="mr-1.5 h-3.5 w-3.5" />Mark paid
+                                  </Button>}
                                 </div>
                               </td>
                             </tr>
@@ -1735,11 +2363,39 @@ export default function Admin({ section }: { section?: AdminSection }) {
                     <div><p className="text-xs font-medium text-muted-foreground">Last updated</p><p>{date(selectedPayout.updated_at)}</p></div>
                     <div><p className="text-xs font-medium text-muted-foreground">Reviewed by</p><p>{selectedPayout.reviewed_by ? (userMap.get(selectedPayout.reviewed_by)?.email || selectedPayout.reviewed_by) : "Awaiting review"}</p></div>
                     <div><p className="text-xs font-medium text-muted-foreground">Reviewed at</p><p>{date(selectedPayout.reviewed_at)}</p></div>
+                    {selectedPayout.rejection_reason && <div className="sm:col-span-2"><p className="text-xs font-medium text-muted-foreground">Rejection reason</p><p className="rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm">{selectedPayout.rejection_reason}</p></div>}
                   </div>}
-                  {selectedPayout?.status === "pending" && <DialogFooter>
-                    <Button variant="destructive" onClick={() => void reviewPayout(selectedPayout, "rejected")} disabled={reviewingPayout === selectedPayout.id}>Decline payout</Button>
-                    <Button variant="gold" onClick={() => void reviewPayout(selectedPayout, "approved")} disabled={reviewingPayout === selectedPayout.id}><Check className="mr-2 h-4 w-4" />Approve payout</Button>
+                  {selectedPayout && (selectedPayout.status === "pending" || selectedPayout.status === "approved") && <DialogFooter>
+                    <div className="w-full space-y-2">
+                      {selectedPayout.status === "pending" && <><Label htmlFor="payout-rejection-reason">Reason for rejection</Label>
+                      <textarea id="payout-rejection-reason" value={payoutRejectionReason} onChange={(event) => setPayoutRejectionReason(event.target.value)} placeholder="Explain why this payout is being rejected" className="min-h-20 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" /></>}
+                      <div className="flex justify-end gap-2">
+                        {selectedPayout.status === "pending" && <Button variant="destructive" onClick={() => void reviewPayout(selectedPayout, "rejected", payoutRejectionReason)} disabled={reviewingPayout === selectedPayout.id || payoutRejectionReason.trim().length < 3}>Decline payout</Button>}
+                        {selectedPayout.status === "pending" && <Button variant="gold" onClick={() => void reviewPayout(selectedPayout, "approved")} disabled={reviewingPayout === selectedPayout.id}><Check className="mr-2 h-4 w-4" />Approve payout</Button>}
+                        {selectedPayout.status === "approved" && <Button variant="gold" onClick={() => void reviewPayout(selectedPayout, "paid")} disabled={reviewingPayout === selectedPayout.id}><Check className="mr-2 h-4 w-4" />Mark paid</Button>}
+                      </div>
+                    </div>
                   </DialogFooter>}
+                </DialogContent>
+              </Dialog>
+
+              <Dialog open={manualAwardOpen} onOpenChange={setManualAwardOpen}>
+                <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-2xl">
+                  <DialogHeader>
+                    <DialogTitle className="flex items-center gap-2"><Award className="h-5 w-5 text-primary" />Award payout certificate</DialogTitle>
+                    <DialogDescription>Issue a verified payout and certificate directly to a selected trader.</DialogDescription>
+                  </DialogHeader>
+                  <div className="grid gap-4 sm:grid-cols-2">
+                    <div className="space-y-2 sm:col-span-2"><Label>Trader</Label><Select value={manualAwardUserId} onValueChange={setManualAwardUserId}><SelectTrigger><SelectValue placeholder="Choose a trader" /></SelectTrigger><SelectContent>{snapshot.users.filter((user) => !user.isAdmin).map((user) => <SelectItem key={user.id} value={user.id}>{user.name || user.email || "Unnamed trader"}</SelectItem>)}</SelectContent></Select></div>
+                    <div className="space-y-2"><Label>Account size</Label><Select value={manualAwardSize} onValueChange={setManualAwardSize}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent>{[5000, 10000, 25000, 50000, 100000, 200000].map((size) => <SelectItem key={size} value={String(size)}>${size.toLocaleString()}</SelectItem>)}</SelectContent></Select></div>
+                    <div className="space-y-2"><Label>Challenge</Label><Select value={manualAwardChallenge} onValueChange={(value) => setManualAwardChallenge(value as GrantChallenge)}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="three_step">3-Step Challenge</SelectItem><SelectItem value="two_step">2-Step Challenge</SelectItem><SelectItem value="one_step">1-Step Challenge</SelectItem><SelectItem value="instant">Instant Funding</SelectItem></SelectContent></Select></div>
+                    <div className="space-y-2"><Label htmlFor="manual-award-amount">Payout amount</Label><Input id="manual-award-amount" type="number" min="0.01" step="0.01" placeholder="2500.00" value={manualAwardAmount} onChange={(event) => setManualAwardAmount(event.target.value)} /></div>
+                    <div className="space-y-2"><Label htmlFor="manual-award-date">Payout date</Label><Input id="manual-award-date" type="date" value={manualAwardDate} onChange={(event) => setManualAwardDate(event.target.value)} /></div>
+                    <div className="space-y-2"><Label>Method</Label><Select value={manualAwardMethod} onValueChange={setManualAwardMethod}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="bank_transfer">Bank transfer</SelectItem><SelectItem value="crypto">Crypto</SelectItem></SelectContent></Select></div>
+                    <div className="space-y-2 sm:col-span-2"><Label htmlFor="manual-award-destination">Payout destination</Label><Input id="manual-award-destination" placeholder={manualAwardMethod === "crypto" ? "Wallet address" : "Bank details or recipient reference"} value={manualAwardDestination} onChange={(event) => setManualAwardDestination(event.target.value)} /></div>
+                  </div>
+                  <div className="rounded-lg border border-primary/20 bg-primary/5 p-4 text-sm text-muted-foreground">This award is approved immediately and creates a dark, downloadable payout certificate in the trader's dashboard.</div>
+                  <DialogFooter><Button variant="outline" onClick={() => setManualAwardOpen(false)}>Cancel</Button><Button variant="gold" onClick={() => void awardManualPayout()} disabled={awardingPayout}>{awardingPayout ? "Awarding..." : "Award payout"}</Button></DialogFooter>
                 </DialogContent>
               </Dialog>
 
@@ -1777,7 +2433,7 @@ export default function Admin({ section }: { section?: AdminSection }) {
                     ) : (
                       <>
                         <Trash2 className="mr-2 h-3.5 w-3.5" />
-                        Delete selected account
+                        Archive selected account
                       </>
                     )}
                   </Button>
@@ -1789,7 +2445,7 @@ export default function Admin({ section }: { section?: AdminSection }) {
                   <CardHeader>
                     <CardTitle className="flex items-center gap-2 text-xl">
                       <Trash2 className="h-5 w-5 text-primary" />
-                      Delete trader
+                      Archive trader accounts
                     </CardTitle>
                     <p className="text-sm text-muted-foreground">
                       Remove a trader and their accounts. Traders with payout
@@ -1823,7 +2479,7 @@ export default function Admin({ section }: { section?: AdminSection }) {
                         onClick={() => void deleteTrader()}
                         disabled={deletingUser || !deleteUserId}
                       >
-                        {deletingUser ? "Deleting..." : "Delete trader"}
+                        {deletingUser ? "Archiving..." : "Archive trader accounts"}
                       </Button>
                     </div>
                   </CardContent>
@@ -2131,15 +2787,15 @@ export default function Admin({ section }: { section?: AdminSection }) {
                   <Card>
                     <CardHeader>
                       <CardTitle className="flex items-center justify-between text-xl">
-                        <span>Trader activity</span>
+                        <span>Traders</span>
                         <Badge variant="outline">
-                          {activeUsers.length} signed in recently
+                          {new Set(snapshot.accounts.filter((account) => account.status !== "pending_payment").map((account) => account.user_id)).size} with accounts
                         </Badge>
                       </CardTitle>
                     </CardHeader>
                     <CardContent className="p-0">
                       <div className="divide-y divide-border/60">
-                        {sortedUsers.map((user) => {
+                        {sortedUsers.filter((user) => snapshot.accounts.some((account) => account.user_id === user.id && account.status !== "pending_payment")).map((user) => {
                           const group = traderGroups.find(
                             (candidate) => candidate.user.id === user.id,
                           );
@@ -2153,7 +2809,7 @@ export default function Admin({ section }: { section?: AdminSection }) {
                           return (
                             <Collapsible key={user.id}>
                               <CollapsibleTrigger asChild>
-                                <button className="flex w-full flex-wrap items-center justify-between gap-4 px-6 py-4 text-left hover:bg-secondary/30">
+                                <button onClick={() => navigate(`/admin/traders/${user.id}`)} className="flex w-full flex-wrap items-center justify-between gap-4 px-6 py-4 text-left hover:bg-secondary/30">
                                   <span className="min-w-0">
                                     <span className="flex items-center gap-2 font-medium">
                                       <span
@@ -2196,6 +2852,10 @@ export default function Admin({ section }: { section?: AdminSection }) {
                                       <p className={cn("mt-2 text-sm font-medium", (account.profit_loss ?? 0) >= 0 ? "text-success" : "text-destructive")}>
                                         {money(account.profit_loss ?? 0)} P/L
                                       </p>
+                                      <div className="mt-2 grid grid-cols-2 gap-2 text-[11px] text-muted-foreground">
+                                        <span>Daily DD: <strong className={cn((account.daily_drawdown_percent ?? 0) >= 80 ? "text-warning" : "text-foreground")}>{(account.daily_drawdown_percent ?? 0).toFixed(2)}%</strong></span>
+                                        <span>Max DD: <strong className={cn((account.max_drawdown_percent ?? 0) >= 80 ? "text-warning" : "text-foreground")}>{(account.max_drawdown_percent ?? 0).toFixed(2)}%</strong></span>
+                                      </div>
                                     </div>
                                   ))}
                                 </div>
@@ -2419,6 +3079,10 @@ export default function Admin({ section }: { section?: AdminSection }) {
                             <th className="px-6 py-3">Trader</th>
                             <th className="px-4 py-3">Joined</th>
                             <th className="px-4 py-3">Status</th>
+                            <th className="px-4 py-3 text-right">Code uses</th>
+                            <th className="px-4 py-3 text-right">Conversions</th>
+                            <th className="px-4 py-3 text-right">Commission</th>
+                            <th className="px-4 py-3 text-right">Analytics</th>
                             <th className="px-6 py-3 text-right">Action</th>
                           </tr>
                         </thead>
@@ -2452,23 +3116,57 @@ export default function Admin({ section }: { section?: AdminSection }) {
                                       : "Normal account"}
                                   </Badge>
                                 </td>
-                                <td className="px-6 py-4 text-right">
+                                <td className="px-4 py-4 text-right">
+                                  <div className="font-medium">{(() => { const code = snapshot.affiliateCodes.find((affiliateCode) => affiliateCode.user_id === user.id)?.code; return code ? countAffiliateCodeUses(snapshot.accounts, code) : 0; })()}</div>
+                                  <div className="text-xs text-muted-foreground">successful purchases</div>
+                                </td>
+                                <td className="px-4 py-4 text-right">
+                                  <div className="font-medium">{snapshot.referrals.filter((referral) => referral.referrer_id === user.id && referral.account_purchased).length}</div>
+                                  <div className="text-xs text-muted-foreground">converted</div>
+                                </td>
+                                <td className="px-4 py-4 text-right">
+                                  <div className="font-medium">{money(snapshot.referrals.filter((referral) => referral.referrer_id === user.id).reduce((total, referral) => total + Number(referral.commission_earned || 0), 0))}</div>
+                                  <div className="text-xs text-muted-foreground">{money(Number(snapshot.affiliateBalances.find((balance) => balance.user_id === user.id)?.available || 0))} available</div>
+                                </td>
+                                <td className="px-4 py-4 text-right">
                                   <Button
-                                    variant={
-                                      user.isAffiliate ? "outline" : "gold"
-                                    }
                                     size="sm"
-                                    onClick={() =>
-                                      void updateAffiliateStatus(user)
-                                    }
-                                    disabled={updatingAffiliate === user.id}
+                                    variant="outline"
+                                    onClick={() => navigate(`/admin/affiliates/${user.id}`)}
                                   >
-                                    {updatingAffiliate === user.id
-                                      ? "Updating..."
-                                      : user.isAffiliate
-                                        ? "Remove access"
-                                        : "Assign affiliate"}
+                                    <BarChart3 className="mr-2 h-3.5 w-3.5" />
+                                    View analytics
                                   </Button>
+                                </td>
+                                <td className="px-6 py-4 text-right">
+                                  {user.isAffiliate ? (
+                                    <Button
+                                      variant="outline"
+                                      size="sm"
+                                      onClick={() => void updateAffiliateStatus(user)}
+                                      disabled={updatingAffiliate === user.id}
+                                    >
+                                      {updatingAffiliate === user.id ? "Updating..." : "Remove access"}
+                                    </Button>
+                                  ) : (
+                                    <div className="flex items-center justify-end gap-2">
+                                      <Input
+                                        value={affiliateAssignDrafts[user.id] ?? ""}
+                                        onChange={(event) => setAffiliateAssignDrafts((current) => ({ ...current, [user.id]: event.target.value.toUpperCase() }))}
+                                        className="h-9 w-24 rounded-md border border-border bg-background px-2 text-xs font-mono"
+                                        placeholder="CODE"
+                                        maxLength={8}
+                                      />
+                                      <Button
+                                        variant="gold"
+                                        size="sm"
+                                        onClick={() => void updateAffiliateStatus(user, affiliateAssignDrafts[user.id])}
+                                        disabled={updatingAffiliate === user.id}
+                                      >
+                                        {updatingAffiliate === user.id ? "Updating..." : "Assign affiliate"}
+                                      </Button>
+                                    </div>
+                                  )}
                                 </td>
                               </tr>
                             ))}

@@ -24,6 +24,7 @@ export type Database = {
           amount: number
           currency: string
           status: string
+          pixel_fired: boolean
           checkout_at: string
           verified_at: string | null
           webhook_at: string | null
@@ -44,6 +45,7 @@ export type Database = {
           amount: number
           currency: string
           status?: string
+          pixel_fired?: boolean
           checkout_at?: string
           verified_at?: string | null
           webhook_at?: string | null
@@ -64,6 +66,7 @@ export type Database = {
           amount?: number
           currency?: string
           status?: string
+          pixel_fired?: boolean
           checkout_at?: string
           verified_at?: string | null
           webhook_at?: string | null
@@ -264,15 +267,25 @@ export type Database = {
         Row: {
           account_size: number
           challenge_type: Database["public"]["Enums"]["challenge_type"]
+          best_trading_day_profit: number | null
+          bogo_bonus_account_size: number | null
+          bogo_bonus_challenge_type: Database["public"]["Enums"]["challenge_type"] | null
+          bonus_of_account_id: string | null
+          closed_profit_total: number | null
+          consistency_score: number | null
           coupon_code: string | null
           created_at: string
           current_balance: number | null
           current_phase: number | null
+          funded_started_at: string | null
+          funded_profit_loss: number
           daily_drawdown_percent: number | null
           daily_start_balance: number | null
           daily_start_date: string | null
           discount_percent: number
           drawdown_violated: boolean | null
+          archived_at: string | null
+          archive_expires_at: string | null
           high_water_mark: number | null
           id: string
           max_drawdown_percent: number | null
@@ -283,6 +296,7 @@ export type Database = {
           payment_reference: string | null
           payment_tx_hash: string | null
           phase_passed: boolean | null
+          risk_monitoring_degraded: boolean
           price: number
           profit_loss: number | null
           status: Database["public"]["Enums"]["account_status"]
@@ -293,15 +307,25 @@ export type Database = {
         Insert: {
           account_size: number
           challenge_type: Database["public"]["Enums"]["challenge_type"]
+          best_trading_day_profit?: number | null
+          bogo_bonus_account_size?: number | null
+          bogo_bonus_challenge_type?: Database["public"]["Enums"]["challenge_type"] | null
+          bonus_of_account_id?: string | null
+          closed_profit_total?: number | null
+          consistency_score?: number | null
           coupon_code?: string | null
           created_at?: string
           current_balance?: number | null
           current_phase?: number | null
+          funded_started_at?: string | null
+          funded_profit_loss?: number
           daily_drawdown_percent?: number | null
           daily_start_balance?: number | null
           daily_start_date?: string | null
           discount_percent?: number
           drawdown_violated?: boolean | null
+          archived_at?: string | null
+          archive_expires_at?: string | null
           high_water_mark?: number | null
           id?: string
           max_drawdown_percent?: number | null
@@ -312,6 +336,7 @@ export type Database = {
           payment_reference?: string | null
           payment_tx_hash?: string | null
           phase_passed?: boolean | null
+          risk_monitoring_degraded?: boolean
           price: number
           profit_loss?: number | null
           status?: Database["public"]["Enums"]["account_status"]
@@ -322,15 +347,25 @@ export type Database = {
         Update: {
           account_size?: number
           challenge_type?: Database["public"]["Enums"]["challenge_type"]
+          best_trading_day_profit?: number | null
+          bogo_bonus_account_size?: number | null
+          bogo_bonus_challenge_type?: Database["public"]["Enums"]["challenge_type"] | null
+          bonus_of_account_id?: string | null
+          closed_profit_total?: number | null
+          consistency_score?: number | null
           coupon_code?: string | null
           created_at?: string
           current_balance?: number | null
           current_phase?: number | null
+          funded_started_at?: string | null
+          funded_profit_loss?: number
           daily_drawdown_percent?: number | null
           daily_start_balance?: number | null
           daily_start_date?: string | null
           discount_percent?: number
           drawdown_violated?: boolean | null
+          archived_at?: string | null
+          archive_expires_at?: string | null
           high_water_mark?: number | null
           id?: string
           max_drawdown_percent?: number | null
@@ -341,6 +376,7 @@ export type Database = {
           payment_reference?: string | null
           payment_tx_hash?: string | null
           phase_passed?: boolean | null
+          risk_monitoring_degraded?: boolean
           price?: number
           profit_loss?: number | null
           status?: Database["public"]["Enums"]["account_status"]
@@ -354,31 +390,43 @@ export type Database = {
         Row: {
           id: string
           user_id: string
-          account_id: string
-          challenge_type: Database["public"]["Enums"]["challenge_type"]
-          account_size: number
-          phase_number: number
-          phase_name: string
+          account_id: string | null
+          challenge_type: Database["public"]["Enums"]["challenge_type"] | null
+          account_size: number | null
+          phase_number: number | null
+          phase_name: string | null
+          payout_id: string | null
+          payout_amount: number | null
+          payout_method: string | null
+          recipient_name: string | null
           awarded_at: string
         }
         Insert: {
           id?: string
           user_id: string
-          account_id: string
-          challenge_type: Database["public"]["Enums"]["challenge_type"]
-          account_size: number
-          phase_number: number
-          phase_name: string
+          account_id?: string | null
+          challenge_type?: Database["public"]["Enums"]["challenge_type"] | null
+          account_size?: number | null
+          phase_number?: number | null
+          phase_name?: string | null
+          payout_id?: string | null
+          payout_amount?: number | null
+          payout_method?: string | null
+          recipient_name?: string | null
           awarded_at?: string
         }
         Update: {
           id?: string
           user_id?: string
-          account_id?: string
-          challenge_type?: Database["public"]["Enums"]["challenge_type"]
-          account_size?: number
-          phase_number?: number
-          phase_name?: string
+          account_id?: string | null
+          challenge_type?: Database["public"]["Enums"]["challenge_type"] | null
+          account_size?: number | null
+          phase_number?: number | null
+          phase_name?: string | null
+          payout_id?: string | null
+          payout_amount?: number | null
+          payout_method?: string | null
+          recipient_name?: string | null
           awarded_at?: string
         }
         Relationships: []
@@ -428,12 +476,17 @@ export type Database = {
             | Database["public"]["Enums"]["challenge_type"][]
             | null
           code: string
+          coupon_type: "discount" | "bogo"
           created_at: string
           discount_percent: number
           expires_at: string | null
           id: string
           is_active: boolean
           max_uses: number | null
+          pay_percent: number | null
+          bonus_account_size: number | null
+          bonus_challenge_type: Database["public"]["Enums"]["challenge_type"] | null
+          bonus_size_mode: "same_as_primary" | "fixed" | null
           times_used: number
           updated_at: string
         }
@@ -442,12 +495,17 @@ export type Database = {
             | Database["public"]["Enums"]["challenge_type"][]
             | null
           code: string
+          coupon_type?: "discount" | "bogo"
           created_at?: string
           discount_percent: number
           expires_at?: string | null
           id?: string
           is_active?: boolean
           max_uses?: number | null
+          pay_percent?: number | null
+          bonus_account_size?: number | null
+          bonus_challenge_type?: Database["public"]["Enums"]["challenge_type"] | null
+          bonus_size_mode?: "same_as_primary" | "fixed" | null
           times_used?: number
           updated_at?: string
         }
@@ -456,12 +514,17 @@ export type Database = {
             | Database["public"]["Enums"]["challenge_type"][]
             | null
           code?: string
+          coupon_type?: "discount" | "bogo"
           created_at?: string
           discount_percent?: number
           expires_at?: string | null
           id?: string
           is_active?: boolean
           max_uses?: number | null
+          pay_percent?: number | null
+          bonus_account_size?: number | null
+          bonus_challenge_type?: Database["public"]["Enums"]["challenge_type"] | null
+          bonus_size_mode?: "same_as_primary" | "fixed" | null
           times_used?: number
           updated_at?: string
         }
@@ -590,8 +653,12 @@ export type Database = {
           account_id: string | null
           created_at: string
           destination: string
+          certificate_account_size: number | null
+          certificate_challenge_type: Database["public"]["Enums"]["challenge_type"] | null
+          payout_date: string | null
           id: string
           method: string
+          rejection_reason: string | null
           source: string
           status: string
           updated_at: string
@@ -602,8 +669,12 @@ export type Database = {
           account_id?: string | null
           created_at?: string
           destination: string
+          certificate_account_size?: number | null
+          certificate_challenge_type?: Database["public"]["Enums"]["challenge_type"] | null
+          payout_date?: string | null
           id?: string
           method: string
+          rejection_reason?: string | null
           source?: string
           status?: string
           updated_at?: string
@@ -614,8 +685,12 @@ export type Database = {
           account_id?: string
           created_at?: string
           destination?: string
+          certificate_account_size?: number | null
+          certificate_challenge_type?: Database["public"]["Enums"]["challenge_type"] | null
+          payout_date?: string | null
           id?: string
           method?: string
+          rejection_reason?: string | null
           source?: string
           status?: string
           updated_at?: string
@@ -833,6 +908,12 @@ export type Database = {
           p_request_id?: string
         }
         Returns: Json
+      }
+      account_consistency_score: {
+        Args: {
+          p_account_id: string
+        }
+        Returns: number
       }
       create_commission_payout: {
         Args: {

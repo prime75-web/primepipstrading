@@ -12,13 +12,13 @@ content_path = "./supabase/templates/confirmation.html"
 subject = "Reset your PrimePips password"
 content_path = "./supabase/templates/recovery.html"
 
-[functions.verify-bsc-payment]
-verify_jwt = false
-
 [functions.forex-prices]
 verify_jwt = false
 
 [functions.korapay-webhook]
+verify_jwt = false
+
+[functions.reconcile-pending-paystack]
 verify_jwt = false
 
 [functions.admin-snapshot]
@@ -34,6 +34,15 @@ verify_jwt = false
 verify_jwt = false
 
 [functions.admin-payout]
+verify_jwt = false
+
+[functions.admin-kyc-review]
+verify_jwt = false
+
+[functions.admin-kyc-document]
+verify_jwt = false
+
+[functions.admin-award-payout]
 verify_jwt = false
 
 [functions.send-transactional-email]

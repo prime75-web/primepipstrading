@@ -21,6 +21,7 @@ import { cn } from "@/lib/utils";
 import { FUNDED_CONSISTENCY_PERCENT, hasConsistencyRule, isInstantAccount } from "@/lib/challengeRules";
 import { supabase } from "@/integrations/supabase/client";
 import DashboardLayout from "@/components/layout/DashboardLayout";
+import { shouldRemovePendingPurchase } from "@/lib/pendingPurchaseCleanup.js";
 
 interface Account {
   id: string;
@@ -32,6 +33,9 @@ interface Account {
   profit_loss: number | null;
   current_phase: number | null;
   drawdown_violated: boolean | null;
+  archived_at: string | null;
+  archive_expires_at: string | null;
+  bonus_of_account_id: string | null;
   created_at: string;
 }
 
@@ -69,13 +73,27 @@ export default function Dashboard() {
 
       const paymentReference = searchParams.get("reference") || searchParams.get("trxref");
       if (paymentReference) {
-        const { error: verificationError } = await supabase.functions.invoke(
+        const { data: verificationData, error: verificationError } = await supabase.functions.invoke(
           "verify-paystack-payment",
           { body: { reference: paymentReference } },
         );
 
         if (verificationError) {
           console.error("Error verifying Paystack payment:", verificationError);
+        }
+        const purchase = verificationData?.purchase;
+        if (
+          verificationData?.verified === true &&
+          purchase &&
+          typeof purchase.value === "number" &&
+          Number.isFinite(purchase.value) &&
+          typeof purchase.orderId === "string"
+        ) {
+          const valueJson = JSON.stringify(purchase.value);
+          const orderIdJson = JSON.stringify(purchase.orderId);
+          const purchaseScript = document.createElement("script");
+          purchaseScript.text = `fbq('track', 'Purchase', {value: ${valueJson}, currency: 'NGN'}, {eventID: ${orderIdJson}});`;
+          document.head.appendChild(purchaseScript);
         }
 
         navigate("/dashboard", { replace: true });
@@ -90,26 +108,87 @@ export default function Dashboard() {
         console.error("Error fetching accounts:", error);
       } else {
         let accountsData = (data || []).filter(
-          (account) => account.status !== "failed" || account.drawdown_violated === true,
+          (account) =>
+            account.status !== "failed" ||
+            account.drawdown_violated === true ||
+            Boolean(account.archived_at),
         );
 
+        const pendingAccountIds = accountsData
+          .filter((account) => account.status === "pending_payment")
+          .map((account) => account.id);
+
+        let paymentStatusesByAccountId = new Map<string, string>();
+        if (pendingAccountIds.length > 0) {
+          const { data: pendingPayments, error: pendingPaymentsError } = await supabase
+            .from("payment_orders")
+            .select("account_id, provider_reference, status")
+            .in("account_id", pendingAccountIds)
+            .in("provider", ["paystack"]);
+
+          if (pendingPaymentsError) {
+            console.error("Error fetching pending payment orders:", pendingPaymentsError);
+          } else {
+            // Re-verify every Paystack order tied to a pending purchase so a successful
+            // payment can still activate the linked account even if the earlier attempt
+            // only updated the payment row and left the account in pending_payment.
+            const paymentsToVerify = (pendingPayments ?? []).filter(
+              (payment) => payment.provider_reference,
+            );
+
+            if (paymentsToVerify.length > 0) {
+              await Promise.all(paymentsToVerify.map(async (payment) => {
+                const { error: verificationError } = await supabase.functions.invoke(
+                  "verify-paystack-payment",
+                  { body: { reference: payment.provider_reference } },
+                );
+
+                if (verificationError) {
+                  console.error(`Error verifying pending payment ${payment.provider_reference}:`, verificationError);
+                }
+              }));
+
+              const { data: refreshedAccounts, error: refreshedAccountsError } = await supabase
+                .from("accounts")
+                .select("*")
+                .order("created_at", { ascending: false });
+
+              if (refreshedAccountsError) {
+                console.error("Error refreshing accounts after payment verification:", refreshedAccountsError);
+              } else {
+                accountsData = (refreshedAccounts || []).filter(
+                  (account) =>
+                    account.status !== "failed" ||
+                    account.drawdown_violated === true ||
+                    Boolean(account.archived_at),
+                );
+              }
+            }
+
+            paymentStatusesByAccountId = new Map(
+              (pendingPayments ?? []).map((payment) => [payment.account_id, payment.status]),
+            );
+          }
+        }
+
         const stalePendingIds = accountsData
-          .filter((account) => {
-            if (account.status !== "pending_payment") return false;
-            const ageMs = Date.now() - new Date(account.created_at).getTime();
-            return ageMs >= PAYMENT_EXPIRY_MS;
-          })
+          .filter((account) => account.payment_provider !== "paystack" && shouldRemovePendingPurchase(
+            account.status,
+            Date.now() - new Date(account.created_at).getTime(),
+            PAYMENT_EXPIRY_MS,
+            paymentStatusesByAccountId.get(account.id) ?? "pending",
+          ))
           .map((account) => account.id);
 
         if (stalePendingIds.length > 0) {
           const { error: stalePendingError } = await supabase
             .from("accounts")
-            .update({ status: "failed" })
+            .delete()
             .in("id", stalePendingIds)
             .eq("status", "pending_payment");
 
           if (stalePendingError) {
-            console.error("Error expiring stale pending accounts:", stalePendingError);
+            console.error("Error removing stale pending accounts:", stalePendingError);
           } else {
             accountsData = accountsData.filter((account) => !stalePendingIds.includes(account.id));
           }
@@ -133,6 +212,7 @@ export default function Dashboard() {
   }, [navigate, searchParams]);
 
   const activeAccounts = accounts.filter(a => a.status === "active" || a.status === "funded");
+  const accountsById = new Map(accounts.map((account) => [account.id, account]));
   const pendingAccounts = accounts.filter(a => a.status === "pending_payment");
   const failedAccounts = accounts.filter(a => a.status === "failed");
 
@@ -188,6 +268,9 @@ export default function Dashboard() {
                   <div className="flex flex-col md:flex-row md:items-center justify-between gap-5">
                     <div className="min-w-0">
                       <div className="flex items-center gap-2 mb-2">
+                        {account.bonus_of_account_id && (
+                          <Badge className="bg-primary/20 text-primary">BOGO bonus</Badge>
+                        )}
                         <Badge className="bg-primary/20 text-primary">
                           {account.status === "funded" || isInstantAccount(account.challenge_type)
                             ? "Funded"
@@ -200,6 +283,12 @@ export default function Dashboard() {
                       <h2 className="text-2xl sm:text-3xl font-bold text-foreground break-words">
                         ${account.account_size.toLocaleString()} {challengeLabels[account.challenge_type]}
                       </h2>
+                      {account.bonus_of_account_id && (
+                        <p className="mt-1 text-sm text-muted-foreground">
+                          Granted with your ${accountsById.get(account.bonus_of_account_id)?.account_size.toLocaleString() ?? ""}{" "}
+                          {challengeLabels[accountsById.get(account.bonus_of_account_id)?.challenge_type ?? ""] ?? "purchased account"}
+                        </p>
+                      )}
                     </div>
                     <div className="flex min-w-0 w-full flex-col gap-4 sm:flex-row sm:flex-wrap sm:items-center md:w-auto md:justify-end">
                       <div className="sm:text-right">
@@ -338,6 +427,12 @@ export default function Dashboard() {
                         {account.profit_loss !== null && (
                           <span className="ml-2">
                             • Final Balance: ${(account.current_balance || account.account_size).toLocaleString()}
+                          </span>
+                        )}
+                        {account.archived_at && account.archive_expires_at && (
+                          <span className="block mt-1">
+                            Archived after failure. This account will be permanently deleted on{" "}
+                            {new Date(account.archive_expires_at).toLocaleString()}.
                           </span>
                         )}
                       </div>

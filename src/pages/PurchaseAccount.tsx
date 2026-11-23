@@ -4,12 +4,13 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
-import { TrendingUp, Check, Zap, Target, Clock, Rocket, Copy, ArrowLeft, HelpCircle, Landmark, Bitcoin, Loader2, Tag, X } from "lucide-react";
+import { TrendingUp, Check, Zap, Target, Clock, Rocket, ArrowLeft, HelpCircle, Landmark, Loader2, Tag, X } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { supabase } from "@/integrations/supabase/client";
 import { FunctionsHttpError } from "@supabase/supabase-js";
 import { cn } from "@/lib/utils";
-import { getInitialPhase } from "@/lib/challengeRules";
+import { getChallengeDisplayRules } from "@/lib/challengeRules";
+import { getCountryName, getCurrencyForCountry } from "@/lib/countryCurrencies";
 import {
   Tooltip,
   TooltipContent,
@@ -24,22 +25,11 @@ interface PricingTier {
   prices: Record<ChallengeType, number>;
 }
 
-interface ChallengeRules {
-  dailyDrawdown: string;
-  maxDrawdown: string;
-  profitTarget: string;
-  consistencyRule: string;
-  minTradingDays: string;
-  weekendTrading: string;
-  maxTradingDays: string;
-  payouts?: string;
-}
-
 const ruleExplanations: Record<string, string> = {
   dailyDrawdown: "Maximum loss allowed in a single trading day. If your daily losses exceed this percentage, you breach the account.",
   maxDrawdown: "Maximum total loss allowed from your highest account balance. Trailing means it follows your highest balance reached.",
   profitTarget: "The profit percentage you need to achieve to pass the evaluation phase or qualify for payouts.",
-  consistencyRule: "Funded accounts require the best trading day to stay within 30% of total profit.",
+  consistencyRule: "The best trading day must stay below 30% of total profit to pass each challenge phase and remain eligible for funded payouts.",
   minTradingDays: "Minimum number of days you must actively trade before completing a phase.",
   weekendTrading: "Whether you can hold trades over the weekend or must close positions before market close on Friday.",
   maxTradingDays: "Maximum time allowed to complete the challenge. Unlimited means no time pressure.",
@@ -47,46 +37,6 @@ const ruleExplanations: Record<string, string> = {
 };
 
 const noConsistencyRuleExplanation = "No consistency rule means you can trade freely.";
-
-const challengeRules: Record<ChallengeType, ChallengeRules> = {
-  three_step: {
-    dailyDrawdown: "4%",
-    maxDrawdown: "6% (trailing)",
-    profitTarget: "10%",
-    consistencyRule: "None",
-    minTradingDays: "4 days",
-    weekendTrading: "Allowed",
-    maxTradingDays: "Unlimited",
-  },
-  two_step: {
-    dailyDrawdown: "4%",
-    maxDrawdown: "8% (trailing)",
-    profitTarget: "10%",
-    consistencyRule: "None",
-    minTradingDays: "4 days",
-    weekendTrading: "Allowed",
-    maxTradingDays: "Unlimited",
-  },
-  one_step: {
-    dailyDrawdown: "6%",
-    maxDrawdown: "8% (trailing)",
-    profitTarget: "10%",
-    consistencyRule: "None",
-    minTradingDays: "4 days",
-    weekendTrading: "Allowed",
-    maxTradingDays: "Unlimited",
-  },
-  instant: {
-    dailyDrawdown: "6%",
-    maxDrawdown: "10%",
-    profitTarget: "N/A",
-    consistencyRule: "30%",
-    minTradingDays: "None",
-    weekendTrading: "Allowed",
-    maxTradingDays: "Unlimited",
-    payouts: "Biweekly",
-  },
-};
 
 const challengeTypes: { id: ChallengeType; label: string; icon: React.ElementType; description: string; badge?: string }[] = [
   { id: "three_step", label: "3-Step Challenge", icon: Target, description: "3 phases to prove your skills" },
@@ -104,12 +54,15 @@ const pricingTiers: PricingTier[] = [
   { size: 200000, label: "$200K", prices: { three_step: 490, two_step: 560, one_step: 520, instant: 520 } },
 ];
 
-const CRYPTO_WALLET = "0x66aeC4645A4d204653d2e62FCA26968Ce1B5db1a";
-
 const challengeLabel = (type: ChallengeType) =>
   challengeTypes.find((c) => c.id === type)?.label ?? type.replace(/_/g, "-");
 
-type PaymentMethod = "paystack" | "crypto";
+const trackMetaEvent = (eventName: "ViewContent" | "InitiateCheckout", content?: Record<string, unknown>) => {
+  const fbq = (window as typeof window & { fbq?: (...args: unknown[]) => void }).fbq;
+  if (typeof fbq === "function") {
+    fbq("track", eventName, content ?? {});
+  }
+};
 
 function RuleItem({ label, value, ruleKey }: { label: string; value: string; ruleKey: string }) {
   const explanation =
@@ -151,8 +104,13 @@ export default function PurchaseAccount() {
     sizeParam ? parseInt(sizeParam) : 10000
   );
   const [showPayment, setShowPayment] = useState(false);
+  const [countryCode, setCountryCode] = useState("NG");
+  const [displayCurrency, setDisplayCurrency] = useState("NGN");
+  const [currencyRates, setCurrencyRates] = useState<Record<string, number> | null>(null);
+  const [currencyQuoteLoading, setCurrencyQuoteLoading] = useState(false);
+  const [currencyQuoteError, setCurrencyQuoteError] = useState<string | null>(null);
+  const [currencyQuoteRetry, setCurrencyQuoteRetry] = useState(0);
   const [isProcessing, setIsProcessing] = useState(false);
-  const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>("paystack");
   const [userId, setUserId] = useState<string | null>(null);
   const [couponInput, setCouponInput] = useState("");
   const [couponLoading, setCouponLoading] = useState(false);
@@ -161,6 +119,11 @@ export default function PurchaseAccount() {
     code: string;
     discountPercent: number;
     challengeTypes: ChallengeType[] | null;
+    couponType: "discount" | "bogo";
+    payPercent: number | null;
+    bonusChallengeType: ChallengeType | null;
+    bonusSizeMode: "same_as_primary" | "fixed" | null;
+    bonusAccountSize: number | null;
   } | null>(null);
   const { toast } = useToast();
   const navigate = useNavigate();
@@ -172,14 +135,57 @@ export default function PurchaseAccount() {
       } else if (session.user.app_metadata?.role === "admin") {
         navigate("/admin", { replace: true });
       } else {
+        const savedCountry = typeof session.user.user_metadata?.country === "string"
+          ? session.user.user_metadata.country.toUpperCase()
+          : "NG";
+        setCountryCode(savedCountry);
+        setDisplayCurrency(getCurrencyForCountry(savedCountry));
         setUserId(session.user.id);
       }
     });
   }, [navigate]);
 
+  useEffect(() => {
+    if (!showPayment || currencyRates) return;
+
+    let cancelled = false;
+    setCurrencyQuoteLoading(true);
+    setCurrencyQuoteError(null);
+
+    fetch("https://open.er-api.com/v6/latest/USD")
+      .then(async (response) => {
+        if (!response.ok) throw new Error("Currency rates are unavailable");
+        const body = await response.json();
+        if (body?.result !== "success" || !body.rates?.NGN) {
+          throw new Error("Currency rates are unavailable");
+        }
+
+        const rates = Object.fromEntries(
+          Object.entries(body.rates).filter(
+            ([code, rate]) => /^[A-Z]{3}$/.test(code) && typeof rate === "number" && rate > 0,
+          ),
+        ) as Record<string, number>;
+        if (!rates[displayCurrency]) throw new Error("The country currency rate is unavailable");
+
+        if (!cancelled) {
+          setCurrencyRates(rates);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setCurrencyQuoteError("We couldn't load a currency estimate. Please try again.");
+      })
+      .finally(() => {
+        if (!cancelled) setCurrencyQuoteLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [showPayment, currencyRates, currencyQuoteRetry, displayCurrency]);
+
   const selectedTier = pricingTiers.find(t => t.size === selectedSize);
   const basePrice = selectedTier?.prices[selectedChallenge] || 0;
-  const rules = challengeRules[selectedChallenge];
+  const rules = getChallengeDisplayRules(selectedChallenge);
   const activeCoupon = appliedCoupon;
 
   const couponApplies =
@@ -188,6 +194,26 @@ export default function PurchaseAccount() {
   const discountPercent = couponApplies ? activeCoupon.discountPercent : 0;
   const discountAmount = Math.round(basePrice * discountPercent) / 100;
   const price = Math.round((basePrice - discountAmount) * 100) / 100;
+  const paystackAmountNgn = currencyRates?.NGN ? Math.ceil(price * currencyRates.NGN) : null;
+  const homeCurrencyAmount = paystackAmountNgn !== null && currencyRates?.[displayCurrency]
+    ? (paystackAmountNgn / currencyRates.NGN) * currencyRates[displayCurrency]
+    : null;
+
+  const formatCurrency = (amount: number, currency: string) =>
+    new Intl.NumberFormat(navigator.language || "en-US", {
+      style: "currency",
+      currency,
+    }).format(amount);
+
+  useEffect(() => {
+    trackMetaEvent("ViewContent", {
+      content_name: challengeLabel(selectedChallenge),
+      content_category: "trading challenge",
+      value: Number.isFinite(price) ? price : 0,
+      currency: "USD",
+      content_ids: [String(selectedSize)],
+    });
+  }, [selectedChallenge, selectedSize, price]);
 
   const applyCoupon = async () => {
     const code = couponInput.trim().toUpperCase();
@@ -198,7 +224,7 @@ export default function PurchaseAccount() {
     const [{ data: couponData, error }, { data: affiliateData }] = await Promise.all([
       supabase
         .from("coupons")
-        .select("code, discount_percent, challenge_types, expires_at, max_uses, times_used")
+        .select("code, discount_percent, challenge_types, coupon_type, pay_percent, bonus_challenge_type, bonus_size_mode, bonus_account_size, expires_at, max_uses, times_used")
         .eq("code", code)
         .eq("is_active", true)
         .maybeSingle(),
@@ -209,7 +235,18 @@ export default function PurchaseAccount() {
         .eq("is_active", true)
         .maybeSingle(),
     ]);
-    const data = couponData || (affiliateData ? { ...affiliateData, challenge_types: null, expires_at: null, max_uses: null, times_used: 0 } : null);
+    const data = couponData || (affiliateData ? {
+      ...affiliateData,
+      coupon_type: "discount",
+      pay_percent: null,
+      bonus_challenge_type: null,
+      bonus_size_mode: null,
+      bonus_account_size: null,
+      challenge_types: null,
+      expires_at: null,
+      max_uses: null,
+      times_used: 0,
+    } : null);
 
     setCouponLoading(false);
 
@@ -230,10 +267,20 @@ export default function PurchaseAccount() {
     }
 
     const challengeTypes = (data.challenge_types as ChallengeType[] | null) ?? null;
+    const couponType = data.coupon_type === "bogo" ? "bogo" : "discount";
+    const payPercent = couponType === "bogo" ? Number(data.pay_percent) : null;
+    const appliedDiscountPercent = couponType === "bogo"
+      ? 100 - (payPercent ?? 100)
+      : Number(data.discount_percent);
     setAppliedCoupon({
       code: data.code,
-      discountPercent: Number(data.discount_percent),
+      discountPercent: appliedDiscountPercent,
       challengeTypes,
+      couponType,
+      payPercent,
+      bonusChallengeType: data.bonus_challenge_type as ChallengeType | null,
+      bonusSizeMode: data.bonus_size_mode as "same_as_primary" | "fixed" | null,
+      bonusAccountSize: data.bonus_account_size === null ? null : Number(data.bonus_account_size),
     });
 
     if (challengeTypes && !challengeTypes.includes(selectedChallenge)) {
@@ -245,7 +292,9 @@ export default function PurchaseAccount() {
     } else {
       toast({
         title: "Coupon applied",
-        description: `${data.code} — ${Number(data.discount_percent)}% off.`,
+        description: couponType === "bogo"
+          ? `${data.code} — pay ${payPercent}% and get a free bonus account.`
+          : `${data.code} — ${appliedDiscountPercent}% off.`,
       });
     }
   };
@@ -256,7 +305,7 @@ export default function PurchaseAccount() {
     setCouponError(null);
   };
 
-  const handlePaystackCheckout = async (paymentMethod: "bank_transfer" | "other" = "bank_transfer") => {
+  const handlePaystackCheckout = async (paymentMethod: "bank_transfer" | "card" | "other" = "bank_transfer") => {
     setIsProcessing(true);
 
     const { data, error } = await supabase.functions.invoke("korapay-checkout", {
@@ -293,51 +342,6 @@ export default function PurchaseAccount() {
     }
 
     window.location.href = data.checkoutUrl;
-  };
-
-  const copyAddress = () => {
-    navigator.clipboard.writeText(CRYPTO_WALLET);
-    toast({
-      title: "Address copied!",
-      description: "Wallet address copied to clipboard.",
-    });
-  };
-
-  const handlePurchase = async () => {
-    if (!userId) return;
-    
-    setIsProcessing(true);
-
-    const { error } = await supabase.from("accounts").insert({
-      user_id: userId,
-      challenge_type: selectedChallenge,
-      account_size: selectedSize,
-      price: price,
-      status: "pending_payment",
-      current_phase: getInitialPhase(selectedChallenge),
-      current_balance: selectedSize,
-      payment_address: CRYPTO_WALLET,
-      coupon_code: couponApplies ? activeCoupon!.code : null,
-      discount_percent: discountPercent,
-    });
-
-    setIsProcessing(false);
-
-    if (error) {
-      toast({
-        title: "Error",
-        description: "Failed to create account. Please try again.",
-        variant: "destructive",
-      });
-      return;
-    }
-
-    toast({
-      title: "Account Created!",
-      description: "Send payment to complete your purchase. We'll activate your account once confirmed.",
-    });
-
-    navigate("/dashboard");
   };
 
   return (
@@ -490,9 +494,22 @@ export default function PurchaseAccount() {
                     </span>
                     {couponApplies ? (
                       <div className="flex items-center justify-between gap-2 rounded-lg border border-primary/50 bg-primary/10 px-3 py-2">
-                        <span className="text-sm font-semibold text-foreground">
-                          {activeCoupon!.code} · {discountPercent}% off
-                        </span>
+                        <div className="text-sm font-semibold text-foreground">
+                          <div>
+                            {activeCoupon!.code}
+                            {activeCoupon!.couponType === "bogo"
+                              ? ` · Pay ${activeCoupon!.payPercent}%`
+                              : ` · ${discountPercent}% off`}
+                          </div>
+                          {activeCoupon!.couponType === "bogo" && activeCoupon!.bonusChallengeType && (
+                            <div className="mt-1 text-xs font-normal text-muted-foreground">
+                              Get a free ${(activeCoupon!.bonusSizeMode === "same_as_primary"
+                                ? selectedSize
+                                : activeCoupon!.bonusAccountSize ?? selectedSize).toLocaleString()}{" "}
+                              {challengeLabel(activeCoupon!.bonusChallengeType)} account
+                            </div>
+                          )}
+                        </div>
                         <Button variant="ghost" size="sm" onClick={removeCoupon}>
                           <X className="w-4 h-4" />
                         </Button>
@@ -528,7 +545,9 @@ export default function PurchaseAccount() {
                       </div>
                       <div className="flex justify-between items-center py-2 border-b border-border">
                         <span className="text-muted-foreground">
-                          Discount ({discountPercent}%)
+                          {activeCoupon?.couponType === "bogo"
+                            ? `BOGO price adjustment (pay ${activeCoupon.payPercent}%)`
+                            : `Discount (${discountPercent}%)`}
                         </span>
                         <span className="font-medium text-primary">-${discountAmount}</span>
                       </div>
@@ -559,7 +578,15 @@ export default function PurchaseAccount() {
                     variant="gold"
                     size="lg"
                     className="w-full mt-6"
-                    onClick={() => setShowPayment(true)}
+                    onClick={() => {
+                      trackMetaEvent("InitiateCheckout", {
+                        content_name: challengeLabel(selectedChallenge),
+                        value: Number.isFinite(price) ? price : 0,
+                        currency: "USD",
+                        content_ids: [String(selectedSize)],
+                      });
+                      setShowPayment(true);
+                    }}
                   >
                     Proceed to Payment
                   </Button>
@@ -581,64 +608,71 @@ export default function PurchaseAccount() {
                 <CardHeader className="text-center">
                   <CardTitle className="text-2xl">Complete Your Payment</CardTitle>
                   <CardDescription>
-                    {challengeTypes.find((c) => c.id === selectedChallenge)?.label} — $
-                    {selectedSize.toLocaleString()} account · ${price}
+                    {challengeTypes.find((c) => c.id === selectedChallenge)?.label} — ${
+                    selectedSize.toLocaleString()} account
+                    {couponApplies && activeCoupon?.couponType === "bogo" && activeCoupon.bonusChallengeType && (
+                      <span className="mt-1 block">
+                        BOGO: pay {activeCoupon.payPercent}% and receive a free $
+                        {(activeCoupon.bonusSizeMode === "same_as_primary"
+                          ? selectedSize
+                          : activeCoupon.bonusAccountSize ?? selectedSize).toLocaleString()}{" "}
+                        {challengeLabel(activeCoupon.bonusChallengeType)} account.
+                      </span>
+                    )}
                   </CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-6">
-                  {/* Payment method selector */}
-                  <div className="grid grid-cols-2 gap-3">
-                    <button
-                      type="button"
-                      onClick={() => setPaymentMethod("paystack")}
-                      className={cn(
-                        "flex flex-col items-center gap-1 rounded-xl border-2 p-4 transition-all",
-                        paymentMethod === "paystack"
-                          ? "border-primary bg-primary/10"
-                          : "border-border hover:border-primary/50"
-                      )}
-                    >
-                      <Landmark
-                        className={cn(
-                          "w-6 h-6",
-                          paymentMethod === "paystack" ? "text-primary" : "text-muted-foreground"
-                        )}
-                      />
-                      <span className="text-sm font-medium text-foreground">Paystack</span>
-                      <span className="text-[11px] text-muted-foreground">Cards & bank payments</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setPaymentMethod("crypto")}
-                      className={cn(
-                        "flex flex-col items-center gap-1 rounded-xl border-2 p-4 transition-all",
-                        paymentMethod === "crypto"
-                          ? "border-primary bg-primary/10"
-                          : "border-border hover:border-primary/50"
-                      )}
-                    >
-                      <Bitcoin
-                        className={cn(
-                          "w-6 h-6",
-                          paymentMethod === "crypto" ? "text-primary" : "text-muted-foreground"
-                        )}
-                      />
-                      <span className="text-sm font-medium text-foreground">Crypto</span>
-                      <span className="text-[11px] text-muted-foreground">USDT / USDC (BSC)</span>
-                    </button>
-                  </div>
-
-                  {paymentMethod === "paystack" ? (
-                    <div className="space-y-6">
-                      <div className="bg-secondary/50 rounded-lg p-6 space-y-5">
+                  <div className="space-y-6">
+                    <div className="bg-secondary/50 rounded-lg p-6 space-y-5">
                         <div className="text-center">
-                          <div className="text-4xl font-bold text-primary mb-1">
-                            ${price}
-                          </div>
-                          <div className="text-sm text-muted-foreground">
+                            <p className="text-sm text-muted-foreground">
+                              Estimated cost for {getCountryName(countryCode)}
+                            </p>
+                            {currencyQuoteLoading ? (
+                              <p className="mt-1 flex justify-center items-center gap-2 text-muted-foreground">
+                                <Loader2 className="h-4 w-4 animate-spin" />
+                                Loading estimate…
+                              </p>
+                            ) : homeCurrencyAmount !== null ? (
+                              <p className="mt-1 text-4xl font-bold text-primary">
+                                {formatCurrency(homeCurrencyAmount, displayCurrency)}
+                              </p>
+                            ) : (
+                              <p className="mt-1 text-sm text-destructive">
+                                {currencyQuoteError ?? "Currency estimate unavailable."}
+                              </p>
+                            )}
+                          <div className="mt-1 text-sm text-muted-foreground">
                             Bank transfer is the default payment method
                           </div>
                         </div>
+
+                        {paystackAmountNgn !== null && (
+                          <p className="text-center text-sm text-muted-foreground">
+                            Paystack checkout amount: {formatCurrency(paystackAmountNgn, "NGN")}
+                          </p>
+                        )}
+
+                        <p className="text-center text-xs text-muted-foreground">
+                          Estimate uses current exchange rates. Your bank may apply a different rate or fees.
+                        </p>
+
+                        {currencyQuoteError && (
+                          <div className="text-center">
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              onClick={() => {
+                                setCurrencyQuoteError(null);
+                                setCurrencyQuoteLoading(true);
+                                setCurrencyQuoteRetry((retry) => retry + 1);
+                              }}
+                            >
+                              Retry estimate
+                            </Button>
+                          </div>
+                        )}
 
                         <div className="text-sm text-muted-foreground space-y-2">
                           <p className="flex items-center gap-2">
@@ -656,8 +690,16 @@ export default function PurchaseAccount() {
                         variant="gold"
                         size="lg"
                         className="w-full"
-                        onClick={() => handlePaystackCheckout("bank_transfer")}
-                        disabled={isProcessing}
+                        onClick={() => {
+                          trackMetaEvent("InitiateCheckout", {
+                            content_name: challengeLabel(selectedChallenge),
+                            value: Number.isFinite(price) ? price : 0,
+                            currency: "USD",
+                            content_ids: [String(selectedSize)],
+                          });
+                          handlePaystackCheckout("bank_transfer");
+                        }}
+                        disabled={isProcessing || currencyQuoteLoading || !currencyRates}
                       >
                         {isProcessing ? (
                           <>
@@ -673,8 +715,34 @@ export default function PurchaseAccount() {
                         variant="outline"
                         size="lg"
                         className="w-full"
-                        onClick={() => handlePaystackCheckout("other")}
-                        disabled={isProcessing}
+                        onClick={() => {
+                          trackMetaEvent("InitiateCheckout", {
+                            content_name: challengeLabel(selectedChallenge),
+                            value: Number.isFinite(price) ? price : 0,
+                            currency: "USD",
+                            content_ids: [String(selectedSize)],
+                          });
+                          handlePaystackCheckout("card");
+                        }}
+                        disabled={isProcessing || currencyQuoteLoading || !currencyRates}
+                      >
+                        Pay securely with Card
+                      </Button>
+
+                      <Button
+                        variant="outline"
+                        size="lg"
+                        className="w-full"
+                        onClick={() => {
+                          trackMetaEvent("InitiateCheckout", {
+                            content_name: challengeLabel(selectedChallenge),
+                            value: Number.isFinite(price) ? price : 0,
+                            currency: "USD",
+                            content_ids: [String(selectedSize)],
+                          });
+                          handlePaystackCheckout("other");
+                        }}
+                        disabled={isProcessing || currencyQuoteLoading || !currencyRates}
                       >
                         Use Another Payment Method
                       </Button>
@@ -683,75 +751,7 @@ export default function PurchaseAccount() {
                         You'll be taken to a secure checkout to finish paying, then returned to your
                         dashboard.
                       </p>
-                    </div>
-                  ) : (
-                  <div className="space-y-6">
-                  <div className="bg-secondary/50 rounded-lg p-6">
-                    <div className="text-center mb-4">
-                      <div className="text-4xl font-bold text-primary mb-2">${price}</div>
-                      <div className="text-muted-foreground">
-                        {challengeTypes.find(c => c.id === selectedChallenge)?.label} - ${selectedSize.toLocaleString()} Account
-                      </div>
-                    </div>
-
-                    {/* QR Code */}
-                    <div className="flex justify-center mb-6">
-                      <div className="p-4 bg-white rounded-xl shadow-sm">
-                        <img 
-                          src={`https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(CRYPTO_WALLET)}`}
-                          alt="Payment QR Code" 
-                          className="w-44 h-44"
-                        />
-                      </div>
-                    </div>
-
-                    <div className="space-y-4">
-                      <div>
-                        <label className="text-sm text-muted-foreground block mb-2">
-                          Wallet Address (BEP-20 - Binance Smart Chain)
-                        </label>
-                        <div className="flex gap-2">
-                          <code className="flex-1 bg-background p-3 rounded-lg text-sm text-foreground break-all border border-border">
-                            {CRYPTO_WALLET}
-                          </code>
-                          <Button variant="outline" onClick={copyAddress}>
-                            <Copy className="w-4 h-4" />
-                          </Button>
-                        </div>
-                      </div>
-
-                      <div className="text-sm text-muted-foreground space-y-2">
-                        <p className="flex items-center gap-2">
-                          <Check className="w-4 h-4 text-primary" />
-                          Accepted: USDT, USDC, BNB (BEP-20 tokens only)
-                        </p>
-                        <p className="flex items-center gap-2">
-                          <Check className="w-4 h-4 text-primary" />
-                          Network: Binance Smart Chain (BSC)
-                        </p>
-                        <p className="flex items-center gap-2">
-                          <Check className="w-4 h-4 text-primary" />
-                          Account activated within 24 hours after confirmation
-                        </p>
-                      </div>
-                    </div>
                   </div>
-
-                  <Button
-                    variant="gold"
-                    size="lg"
-                    className="w-full"
-                    onClick={handlePurchase}
-                    disabled={isProcessing}
-                  >
-                    {isProcessing ? "Processing..." : "I've Sent the Payment"}
-                  </Button>
-
-                  <p className="text-center text-sm text-muted-foreground">
-                    After sending payment, click the button above. Your account will be activated once we confirm the transaction.
-                  </p>
-                  </div>
-                  )}
                 </CardContent>
               </Card>
             </div>

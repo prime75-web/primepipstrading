@@ -22,9 +22,12 @@ import {
 import { cn } from "@/lib/utils";
 import { supabase } from "@/integrations/supabase/client";
 import { useToast } from "@/hooks/use-toast";
+import { useHideOnScroll } from "@/hooks/use-hide-on-scroll";
 import NotificationsCenter from "@/components/layout/NotificationsCenter";
 
-const sidebarLinks: Array<{ href: string; icon: typeof Activity; label: string; nested?: boolean }> = [
+type SidebarLink = { href: string; icon: typeof Activity; label: string; nested?: boolean };
+
+const sidebarLinks: SidebarLink[] = [
   { href: "/dashboard", icon: BarChart3, label: "Overview" },
   { href: "/dashboard/analytics", icon: LineChart, label: "Analytics", nested: true },
   { href: "/dashboard/payouts", icon: Wallet, label: "Payouts" },
@@ -33,14 +36,15 @@ const sidebarLinks: Array<{ href: string; icon: typeof Activity; label: string; 
   { href: "/dashboard/billing", icon: CreditCard, label: "Billing" },
 ];
 
-const adminLinks = [
+const adminLinks: SidebarLink[] = [
   { href: "/admin", icon: ShieldCheck, label: "Platform overview" },
   { href: "/admin/kyc", icon: FileCheck2, label: "KYC review" },
-  { href: "/admin/traders", icon: Users, label: "Trader activity" },
+  { href: "/admin/traders", icon: Users, label: "Traders" },
   { href: "/admin/exposure", icon: LineChart, label: "Trading exposure" },
   { href: "/admin/referrals", icon: Users, label: "Referral analytics" },
   { href: "/admin/affiliates", icon: Users, label: "Affiliate partners" },
   { href: "/admin/activity", icon: Activity, label: "Trade activity" },
+  { href: "/admin/purchased-accounts", icon: Wallet, label: "Purchased accounts" },
   { href: "/admin/payouts", icon: Wallet, label: "Payout requests" },
   { href: "/admin/payments", icon: CreditCard, label: "Payment reconciliation" },
   { href: "/admin/coupons", icon: Tag, label: "Purchase coupons" },
@@ -61,6 +65,7 @@ export default function DashboardLayout({ children, title, subtitle }: Dashboard
   const navigate = useNavigate();
   const location = useLocation();
   const { toast } = useToast();
+  const isHeaderVisible = useHideOnScroll();
 
   const handleNavigation = (href: string) => {
     setSidebarOpen(false);
@@ -209,7 +214,10 @@ export default function DashboardLayout({ children, title, subtitle }: Dashboard
       {/* Main Content */}
       <div className="flex min-w-0 flex-1 flex-col">
         {/* Top Bar */}
-        <header className="sticky top-0 z-30 bg-card/80 backdrop-blur-xl border-b border-border px-4 lg:px-8 py-4">
+        <header className={cn(
+          "sticky top-0 z-30 bg-card/80 backdrop-blur-xl border-b border-border px-4 lg:px-8 py-4 transition-transform duration-300 ease-in-out",
+          isHeaderVisible ? "translate-y-0" : "-translate-y-full",
+        )}>
           <div className="flex min-w-0 items-center justify-between gap-2">
             <div className="flex min-w-0 items-center gap-4">
               <button

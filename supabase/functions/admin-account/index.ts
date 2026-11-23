@@ -1,5 +1,3 @@
-import { createClient } from "npm:@supabase/supabase-js@2";
-
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
@@ -15,6 +13,77 @@ const accountStatuses = ["pending_payment", "active", "failed", "passed", "funde
 
 type ChallengeType = (typeof challengeTypes)[number];
 
+async function supabaseRest<T>(path: string, method: string, token: string, body?: unknown, query = ""): Promise<T | null> {
+  const url = new URL(`${supabaseUrl}/rest/v1/${path}`);
+  if (query) url.search = query;
+
+  const response = await fetch(url.toString(), {
+    method,
+    headers: {
+      apikey: token,
+      Authorization: `Bearer ${token}`,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      Prefer: "return=representation",
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+
+  const text = await response.text();
+  let parsed: unknown = null;
+  if (text) {
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = { message: text };
+    }
+  }
+
+  if (!response.ok) {
+    const message = (parsed as { message?: string; error?: string } | null)?.message ?? (parsed as { message?: string; error?: string } | null)?.error ?? `Request failed with status ${response.status}`;
+    throw new Error(String(message));
+  }
+
+  return parsed as T | null;
+}
+
+function getJwtRole(token: string): string | null {
+  try {
+    const payload = token.split(".")[1];
+    if (!payload) return null;
+
+    const normalized = payload.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
+    const decoded = atob(padded);
+    const parsed = JSON.parse(decoded);
+
+    return parsed?.app_metadata?.role ?? parsed?.role ?? parsed?.claims?.app_metadata?.role ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function getUserById(userId: string) {
+  const response = await fetch(`${supabaseUrl}/auth/v1/admin/users/${encodeURIComponent(userId)}`, {
+    method: "GET",
+    headers: {
+      apikey: serviceRoleKey,
+      Authorization: `Bearer ${serviceRoleKey}`,
+      Accept: "application/json",
+    },
+  });
+
+  const text = await response.text();
+  const json = text ? JSON.parse(text) : null;
+
+  if (!response.ok) {
+    const message = json?.message ?? "User not found";
+    throw new Error(String(message));
+  }
+
+  return json;
+}
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
   const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), {
@@ -26,63 +95,110 @@ Deno.serve(async (req) => {
     const authorization = req.headers.get("Authorization");
     if (!authorization?.startsWith("Bearer ")) return json({ error: "Unauthorized" }, 401);
 
-    const authClient = createClient(supabaseUrl, anonKey, { global: { headers: { Authorization: authorization } } });
     const token = authorization.replace("Bearer ", "");
-    const { data: claimsData, error: claimsError } = await authClient.auth.getClaims(token);
-    if (claimsError || claimsData?.claims?.app_metadata?.role !== "admin") return json({ error: "Forbidden" }, 403);
+    const userRole = getJwtRole(token);
+    if (userRole !== "admin") return json({ error: "Forbidden" }, 403);
 
     const body = await req.json();
-    const admin = createClient(supabaseUrl, serviceRoleKey);
-    const { data: target, error: targetError } = await admin.auth.admin.getUserById(body.userId);
-    if (targetError || !target.user) return json({ error: "User not found" }, 404);
-    if (target.user.app_metadata?.role === "admin") return json({ error: "Accounts cannot be granted to admins" }, 400);
+    const action = typeof body?.action === "string"
+      ? body.action
+      : (
+          typeof body?.userId === "string" && body.userId.length > 0 &&
+          typeof body?.challengeType === "string" &&
+          typeof body?.accountSize === "number"
+            ? "grant"
+            : null
+        );
+    if (!action) return json({ error: "Action required" }, 400);
+
+    const hasUserId = typeof body.userId === "string" && body.userId.length > 0;
+
+    if (action !== "delete-archived" && !hasUserId) return json({ error: "Invalid user details" }, 400);
+    if (hasUserId && action !== "delete-archived" && action !== "update") {
+      const target = await getUserById(body.userId);
+      const targetUser = target?.user ?? target;
+      if (!targetUser) return json({ error: "User not found" }, 404);
+      if (targetUser.app_metadata?.role === "admin") return json({ error: "Accounts cannot be granted to admins" }, 400);
+    }
 
     if (body.action === "delete-user") {
-      const { data: accountsToDelete, error: accountLookupError } = await admin.from("accounts").select("id").eq("user_id", body.userId);
-      if (accountLookupError) return json({ error: "Could not verify trader accounts" }, 500);
+      const accountsToDelete = await supabaseRest<Array<{ id: string }>>("accounts", "GET", serviceRoleKey, undefined, `select=id&user_id=eq.${encodeURIComponent(body.userId)}&archived_at=is.null`);
       const accountIds = (accountsToDelete ?? []).map((account) => account.id);
       if (accountIds.length) {
-        const { count, error: payoutError } = await admin.from("payout_requests").select("id", { count: "exact", head: true }).in("account_id", accountIds);
-        if (payoutError) return json({ error: "Could not verify account payout history" }, 500);
-        if ((count ?? 0) > 0) return json({ error: "This trader has an account with payout history and cannot be deleted" }, 409);
-        const { error: accountDeleteError } = await admin.from("accounts").delete().eq("user_id", body.userId);
-        if (accountDeleteError) return json({ error: "Could not delete trader accounts" }, 500);
+        const archiveExpiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+        await supabaseRest("accounts", "PATCH", serviceRoleKey, {
+          archived_at: new Date().toISOString(),
+          archive_expires_at: archiveExpiresAt,
+        }, `user_id=eq.${encodeURIComponent(body.userId)}&archived_at=is.null`);
       }
-      const { error: deleteError } = await admin.auth.admin.deleteUser(body.userId);
-      if (deleteError) {
-        console.error("Could not delete trader:", deleteError.message);
-        return json({ error: "Could not delete trader" }, 500);
-      }
-      return json({ deleted: true, userId: body.userId });
+      return json({ archived: true, userId: body.userId });
     }
 
     if (body.action === "delete") {
       if (typeof body.accountId !== "string" || typeof body.userId !== "string") return json({ error: "Invalid account details" }, 400);
 
-      const { count, error: payoutError } = await admin.from("payout_requests").select("id", { count: "exact", head: true }).eq("account_id", body.accountId);
-      if (payoutError) return json({ error: "Could not verify account payout history" }, 500);
-      if ((count ?? 0) > 0) return json({ error: "Accounts with payout requests cannot be deleted" }, 409);
+      const archiveExpiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+      await supabaseRest("accounts", "PATCH", serviceRoleKey, {
+        archived_at: new Date().toISOString(),
+        archive_expires_at: archiveExpiresAt,
+      }, `id=eq.${encodeURIComponent(body.accountId)}&user_id=eq.${encodeURIComponent(body.userId)}&archived_at=is.null`);
+      return json({ deleted: true, archived: true, archiveExpiresAt, accountId: body.accountId });
+    }
 
-      const { error: accountError } = await admin.from("accounts").delete().eq("id", body.accountId).eq("user_id", body.userId);
-      if (accountError) {
-        console.error("Could not delete account:", accountError.message);
-        return json({ error: "Could not delete account" }, 500);
+    if (body.action === "delete-archived") {
+      if (typeof body.accountId !== "string") return json({ error: "Invalid account details" }, 400);
+
+      let filterQuery = `id=eq.${encodeURIComponent(body.accountId)}&archived_at=not.is.null`;
+      if (typeof body.userId === "string" && body.userId.length > 0) {
+        filterQuery += `&user_id=eq.${encodeURIComponent(body.userId)}`;
       }
-      return json({ deleted: true, accountId: body.accountId });
+
+      try {
+        const existingRows = await supabaseRest<Array<{ id: string }>>("accounts", "GET", serviceRoleKey, undefined, `select=id&${filterQuery}`);
+        if (!existingRows?.length) return json({ error: "Archived account not found or it is not eligible for permanent deletion" }, 404);
+
+        const deletedRows = await supabaseRest<Array<{ id: string }>>("accounts", "DELETE", serviceRoleKey, undefined, `${filterQuery}&select=id`);
+        if (!deletedRows?.length) return json({ error: "Archived account not found or it is not eligible for permanent deletion" }, 404);
+
+        return json({ deleted: true, accountId: body.accountId });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Could not permanently delete archived account";
+        return json({ error: message }, 500);
+      }
+    }
+
+    if (body.action === "restore") {
+      if (typeof body.accountId !== "string" || typeof body.userId !== "string") return json({ error: "Invalid account details" }, 400);
+
+      const account = await supabaseRest<Array<Record<string, unknown>>>("accounts", "PATCH", serviceRoleKey, {
+        archived_at: null,
+        archive_expires_at: null,
+      }, `id=eq.${encodeURIComponent(body.accountId)}&user_id=eq.${encodeURIComponent(body.userId)}&archived_at=not.is.null&archive_expires_at=gt.${encodeURIComponent(new Date().toISOString())}&select=id,user_id,account_size,challenge_type,status,current_balance,profit_loss,current_phase,archived_at,archive_expires_at,updated_at,created_at`);
+      const restored = Array.isArray(account) ? account[0] : null;
+      if (!restored) return json({ error: "The archive has expired or the account was not found" }, 404);
+      return json({ account: restored, restored: true });
     }
 
     if (body.action === "reset") {
       if (typeof body.accountId !== "string" || typeof body.userId !== "string") return json({ error: "Invalid account details" }, 400);
 
-      const { data: account, error: resetError } = await admin.rpc("admin_reset_account", {
-        p_account_id: body.accountId,
-        p_user_id: body.userId,
+      const rpcQuery = new URLSearchParams({ p_account_id: body.accountId, p_user_id: body.userId });
+      const response = await fetch(`${supabaseUrl}/rest/v1/rpc/admin_reset_account?${rpcQuery.toString()}`, {
+        method: "POST",
+        headers: {
+          apikey: serviceRoleKey,
+          Authorization: `Bearer ${serviceRoleKey}`,
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
       });
-      if (resetError) {
-        console.error("Could not reset account:", resetError.message);
-        return json({ error: resetError.message === "Account not found" ? resetError.message : "Could not reset account" }, resetError.message === "Account not found" ? 404 : 500);
+      const text = await response.text();
+      const jsonBody = text ? JSON.parse(text) : null;
+      if (!response.ok) {
+        const message = jsonBody?.message ?? jsonBody?.error ?? "Could not reset account";
+        return json({ error: message === "Account not found" ? message : "Could not reset account" }, message === "Account not found" ? 404 : 500);
       }
-      return json({ account });
+      return json({ account: jsonBody });
     }
 
     if (body.action === "update") {
@@ -95,28 +211,65 @@ Deno.serve(async (req) => {
         return json({ error: "Invalid account details" }, 400);
       }
 
-      const { data: account, error: accountError } = await admin.from("accounts").update({
+      const existingAccounts = await supabaseRest<Array<Record<string, unknown>>>("accounts", "GET", serviceRoleKey, undefined,
+        `id=eq.${encodeURIComponent(body.accountId)}&select=id,status,payment_reference,challenge_type,account_size,current_balance,profit_loss,current_phase`);
+      const existingAccount = existingAccounts?.[0];
+
+      if (!existingAccount) return json({ error: "Account not found" }, 404);
+
+      if (existingAccount.status === "pending_payment" && ["active", "funded"].includes(body.status)) {
+        let recoveredAccount: Record<string, unknown> | null = null;
+        try {
+          recoveredAccount = await supabaseRest<Record<string, unknown>>(
+            "rpc/admin_activate_pending_account",
+            "POST",
+            serviceRoleKey,
+            { p_account_id: body.accountId },
+          );
+        } catch (recoveryError) {
+          const message = recoveryError instanceof Error ? recoveryError.message : "Payment recovery failed";
+          console.error("Admin pending account activation failed:", recoveryError);
+          return json({ error: message, code: "ADMIN_ACCOUNT_ACTIVATION_FAILED" }, 409);
+        }
+
+        if (recoveredAccount && ["active", "funded"].includes(String(recoveredAccount.status))) {
+          return json({ account: recoveredAccount, recoveredPayment: true });
+        }
+
+        return json({ error: "Payment reconciliation did not activate the account." }, 409);
+      }
+
+      const isPendingActivation = existingAccount.status === "pending_payment" && ["active", "funded"].includes(body.status);
+      const updatePayload = {
         user_id: body.userId,
         challenge_type: body.challengeType,
         account_size: body.accountSize,
         status: body.status,
-        current_phase: body.currentPhase,
-        current_balance: body.currentBalance,
-        profit_loss: body.profitLoss,
-      }).eq("id", body.accountId).select("id, user_id, account_size, challenge_type, status, current_balance, profit_loss, current_phase, updated_at, created_at").single();
-
-      if (accountError) {
-        console.error("Could not update account:", accountError.message);
-        return json({ error: "Could not update account" }, 500);
-      }
-      return json({ account });
+        current_phase: isPendingActivation
+          ? (existingAccount.challenge_type === "instant" ? null : (existingAccount.current_phase ?? 1))
+          : body.currentPhase,
+        current_balance: isPendingActivation
+          ? (existingAccount.current_balance ?? existingAccount.account_size)
+          : body.currentBalance,
+        profit_loss: isPendingActivation
+          ? (existingAccount.profit_loss ?? 0)
+          : body.profitLoss,
+      };
+      const account = await supabaseRest<Array<Record<string, unknown>>>("accounts", "PATCH", serviceRoleKey, updatePayload,
+        `id=eq.${encodeURIComponent(body.accountId)}&select=id,user_id,account_size,challenge_type,status,current_balance,profit_loss,current_phase,archived_at,archive_expires_at,updated_at,created_at`);
+      const updated = Array.isArray(account) && account[0]
+        ? account[0]
+        : (await supabaseRest<Array<Record<string, unknown>>>("accounts", "GET", serviceRoleKey, undefined,
+          `id=eq.${encodeURIComponent(body.accountId)}&select=id,user_id,account_size,challenge_type,status,current_balance,profit_loss,current_phase,archived_at,archive_expires_at,updated_at,created_at`))?.[0];
+      if (!updated) return json({ error: "Could not update account" }, 500);
+      return json({ account: updated });
     }
 
     if (typeof body.userId !== "string" || !challengeTypes.includes(body.challengeType as ChallengeType) || !accountSizes.includes(body.accountSize)) {
       return json({ error: "Invalid account details" }, 400);
     }
 
-    const { data: account, error: accountError } = await admin.from("accounts").insert({
+    const account = await supabaseRest<Array<Record<string, unknown>>>("accounts", "POST", serviceRoleKey, {
       user_id: body.userId,
       challenge_type: body.challengeType,
       account_size: body.accountSize,
@@ -124,18 +277,15 @@ Deno.serve(async (req) => {
       status: body.challengeType === "instant" ? "funded" : "active",
       current_balance: body.accountSize,
       current_phase: body.challengeType === "instant" ? null : 1,
-    }).select("id, user_id, account_size, challenge_type, status, current_balance, profit_loss, current_phase, updated_at, created_at").single();
+    }, "select=id,user_id,account_size,challenge_type,status,current_balance,profit_loss,current_phase,updated_at,created_at");
+    const inserted = Array.isArray(account) ? account[0] : null;
+    if (!inserted) return json({ error: "Could not grant account" }, 500);
 
-    if (accountError) {
-      console.error("Could not grant account:", accountError.message);
-      return json({ error: "Could not grant account" }, 500);
-    }
-
-    const { error: ledgerError } = await admin.from("payment_orders").insert({
+    const ledgerResult = await supabaseRest("payment_orders", "POST", serviceRoleKey, {
       user_id: body.userId,
-      account_id: account.id,
+      account_id: inserted.id,
       provider: "admin",
-      provider_reference: `grant-${account.id}`,
+      provider_reference: `grant-${inserted.id}`,
       amount: 0,
       currency: "USD",
       status: "granted",
@@ -143,15 +293,17 @@ Deno.serve(async (req) => {
       provider_metadata: { granted_by_admin: true },
     });
 
-    if (ledgerError) {
-      await admin.from("accounts").delete().eq("id", account.id);
-      console.error("Could not record granted account in billing:", ledgerError.message);
+    if (!ledgerResult) {
+      await supabaseRest("accounts", "DELETE", serviceRoleKey, undefined, `id=eq.${encodeURIComponent(String(inserted.id))}`);
       return json({ error: "Could not record granted account" }, 500);
     }
 
-    return json({ account });
+    return json({ account: inserted });
   } catch (error) {
     console.error("admin-account error:", error);
-    return json({ error: "Unexpected error" }, 500);
+    return json({
+      error: error instanceof Error ? error.message : "Unexpected error",
+      code: "ADMIN_ACCOUNT_SERVER_ERROR",
+    }, 409);
   }
 });

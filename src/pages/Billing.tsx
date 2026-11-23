@@ -27,7 +27,7 @@ import jsPDF from "jspdf";
 interface Invoice {
   id: string;
   amount: number;
-  status: "pending" | "paid" | "failed" | "overdue" | "refunded" | "unmatched" | "granted";
+  status: "pending" | "earned" | "paid" | "failed" | "overdue" | "refunded" | "unmatched" | "granted";
   date: string;
   due_date: string;
   description: string;
@@ -42,6 +42,7 @@ interface BillingAccount {
   created_at: string;
   account_size: number;
   challenge_type: string;
+  bonus_of_account_id: string | null;
 }
 
 interface CommissionEntry {
@@ -67,6 +68,11 @@ const statusConfig: Record<string, { icon: typeof Clock; color: string; label: s
     icon: CheckCircle2,
     color: "bg-success/20 text-success",
     label: "Paid",
+  },
+  earned: {
+    icon: Gift,
+    color: "bg-primary/20 text-primary",
+    label: "Earned",
   },
   overdue: {
     icon: AlertCircle,
@@ -202,7 +208,7 @@ export default function BillingPage() {
       const [{ data: accounts, error: accountsError }, { data: payments, error: paymentsError }] = await Promise.all([
         supabase
           .from("accounts")
-          .select("id, price, status, created_at, account_size, challenge_type")
+          .select("id, price, status, created_at, account_size, challenge_type, bonus_of_account_id")
           .order("created_at", { ascending: false }),
         supabase
           .from("payment_orders")
@@ -218,7 +224,9 @@ export default function BillingPage() {
       const paymentsByAccount = new Map(paymentRows.filter((payment) => payment.account_id).map((payment) => [payment.account_id, payment]));
       const generatedInvoices: Invoice[] = accountRows.map((account) => {
         const payment = paymentsByAccount.get(account.id);
-        const status = account.status === "pending_payment"
+        const status = account.bonus_of_account_id
+          ? "granted"
+          : account.status === "pending_payment"
           ? "pending"
           : account.status === "failed"
             ? "failed"
@@ -229,7 +237,7 @@ export default function BillingPage() {
           status,
           date: payment?.checkout_at || account.created_at,
           due_date: payment?.checkout_at || account.created_at,
-          description: `${account.account_size.toLocaleString()} ${account.challenge_type.replace(/_/g, " ")} Challenge`,
+          description: `${account.bonus_of_account_id ? "BOGO bonus account: " : ""}${account.account_size.toLocaleString()} ${account.challenge_type.replace(/_/g, " ")} Challenge${account.bonus_of_account_id ? ` (granted with account ${account.bonus_of_account_id.slice(0, 8)})` : ""}`,
           currency: payment?.currency,
           reference: payment?.provider_reference,
         };
@@ -277,7 +285,7 @@ export default function BillingPage() {
       const commissionEntries: Invoice[] = (commissionData as CommissionEntry[] || []).map((entry) => ({
         id: `COM-${entry.id.slice(0, 8).toUpperCase()}`,
         amount: entry.commission_earned,
-        status: "paid",
+        status: "earned",
         date: entry.referred_at,
         due_date: entry.referred_at,
         description: "Referral commission earned",
